@@ -1,0 +1,6 @@
+ignore:
+    - .github
+    - .vscode
+    - README.md
+    - CHANGELOG.md
+    - LICENSE
