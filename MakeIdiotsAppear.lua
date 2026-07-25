@@ -1199,6 +1199,20 @@ local function ClearPendingInvite(key)
   Engine.pendingInviteSentAt[key] = nil
 end
 
+-- Lets someone who resolves as "not joined" (declined, bounced, or timed
+-- out) become eligible for the very next scheduled pass instead of waiting
+-- out an extra full interval before RunInvitePass's own end-of-pass
+-- recompute would otherwise notice them.
+local function RequeueForRetry(fullName)
+  if not Engine.running then return end
+  for _, queued in ipairs(Engine.queue) do
+    if queued:lower() == fullName:lower() then
+      return
+    end
+  end
+  table.insert(Engine.queue, fullName)
+end
+
 -- Multiple invites can be outstanding at once now, so a system message has to
 -- be matched against whichever of them it actually refers to, not a single
 -- "current" invitee. pendingInvites is keyed by full "name-realm" - if the
@@ -1265,7 +1279,11 @@ PruneExpiredPendingInvites = function()
   local now = GetTime()
   for key, sentAt in pairs(Engine.pendingInviteSentAt) do
     if now - sentAt > INVITE_EXPIRATION_SECONDS then
+      local fullName = Engine.pendingInvites[key]
       ClearPendingInvite(key)
+      if fullName then
+        RequeueForRetry(fullName)
+      end
     end
   end
 end
@@ -1461,6 +1479,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
           print(PREFIX .. "Could not whisper " .. fullName .. " (" .. tostring(err) .. ").")
         end
         table.insert(Engine.skipped, fullName)
+        RequeueForRetry(fullName)
         FireStateChanged()
         return
       end
@@ -1472,6 +1491,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
       if fullName then
         table.insert(Engine.skipped, fullName)
         table.insert(Engine.offlineThisPass, fullName)
+        RequeueForRetry(fullName)
         FireStateChanged()
         return
       end
@@ -1482,6 +1502,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
       local fullName = matched and TakePendingInvite(matched)
       if fullName then
         table.insert(Engine.skipped, fullName)
+        RequeueForRetry(fullName)
         FireStateChanged()
         return
       end
