@@ -359,12 +359,16 @@ local function RefreshPlayerList()
   playerScroll:SetScroll(savedScroll)
 
   -- Always released/rebuilt (not just when shown) so no stale rows are left
-  -- sitting around invisibly if the bench empties out next refresh.
+  -- sitting around invisibly if the bench empties out next refresh. Same
+  -- scroll snap-back issue as playerScroll above (see its comment), so save
+  -- and restore the bench's own scroll position around the rebuild too.
+  local savedBenchScroll = benchScroll.localstatus and benchScroll.localstatus.scrollvalue or 0
   benchScroll:ReleaseChildren()
   for _, entry in ipairs(benchEntries) do
     benchScroll:AddChild(CreateBenchRow(entry.fullName, entry.status, classMap))
   end
   benchScroll:DoLayout()
+  benchScroll:SetScroll(savedBenchScroll)
 end
 
 local function RefreshEngineStatus()
