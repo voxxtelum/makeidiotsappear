@@ -1,0 +1,1490 @@
+-- MakeIdiotsAppear.lua
+-- Core: saved variables, name normalization, master roster tracking, invite engine.
+
+local ADDON_NAME, ns = ...
+ns.ADDON_NAME = ADDON_NAME
+
+local PREFIX = "|cff33ff99MakeIdiotsAppear|r: "
+ns.PREFIX = PREFIX
+
+-- Reads the "## Version:" line from MakeIdiotsAppear.toc, so the addon's
+-- actual shipped version (rather than a separately-maintained copy of it)
+-- is available wherever it's needed - currently just the Main window's
+-- title, but kept as a general-purpose accessor for future uses.
+-- C_AddOns.GetAddOnMetadata is the current API; GetAddOnMetadata is kept as
+-- a fallback for older clients where it's still the global.
+local function GetAddonVersion()
+  local getMetadata = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
+  return (getMetadata and getMetadata(ADDON_NAME, "Version")) or "?"
+end
+ns.GetAddonVersion = GetAddonVersion
+
+-- Toggled via "/mia debug" (or "/ri debug" / "/ric debug"). Gates the extra
+-- diagnostic prints scattered through the invite/durability engine (see
+-- DebugPrint below) - harmless to leave in permanently, since they're
+-- silent unless someone turns it on.
+local function DebugPrint(msg)
+  if MakeIdiotsAppearDB and MakeIdiotsAppearDB.settings and MakeIdiotsAppearDB.settings.debugMode then
+    print(PREFIX .. "[debug] " .. msg)
+  end
+end
+ns.DebugPrint = DebugPrint
+
+----------------------------------------------------------------------
+-- UI helpers
+----------------------------------------------------------------------
+
+-- ElvUI (and similar unitframe/skinning suites) automatically re-skins
+-- every Ace3-based frame it finds, replacing whatever border/background
+-- AceGUI itself drew with its own flat style. Our own border/title changes
+-- below would only fight that - drawn first, then either fought over or
+-- left looking inconsistent next to ElvUI's actual skin - so this bails out
+-- entirely and leaves AceGUI's stock look in place whenever ElvUI is
+-- loaded, letting it reskin normally instead. C_AddOns.IsAddOnLoaded is the
+-- current API; IsAddOnLoaded is kept as a fallback for older clients where
+-- it's still the global.
+local function IsElvUILoaded()
+  local isLoaded = (C_AddOns and C_AddOns.IsAddOnLoaded) or IsAddOnLoaded
+  return isLoaded and isLoaded("ElvUI") and true or false
+end
+
+-- Swaps AceGUI's Frame widget's own default look (the thick ornate
+-- Interface\DialogFrame\UI-DialogBox-Border/Header) for a plainer Blizzard
+-- tooltip-style border - the same edgeFile/tileSize/insets AceGUI's own
+-- InlineGroup/TabGroup widgets already use for panel borders elsewhere in
+-- this addon (see PaneBackdrop in AceGUIContainer-InlineGroup.lua), so it's
+-- already known to render fine on this client. Keeps the same parchment
+-- background texture - only the edge art and its proportions change.
+--
+-- The ornate rope-and-post title banner is a separate thing entirely - not
+-- part of the backdrop, but three individual textures (a center piece plus
+-- left/right end caps) AceGUI draws directly onto the frame. Only the center
+-- one is exposed on the widget table (as .titlebg); the two end caps aren't
+-- exposed at all, and can't be reliably picked out by matching their
+-- texture path (Texture:GetTexture() can return either the path or a
+-- numeric fileID depending on client version - comparing against a
+-- hardcoded path string silently matches nothing on a client that returns
+-- the fileID) or by blanket-hiding every texture region on frame (this
+-- particular client implements SetBackdrop itself via real texture regions
+-- parented to frame too, so that wiped out the border/background as well).
+-- What's reliable: both end caps are anchored specifically *to* titlebg
+-- (SetPoint(..., titlebg, ...)) in AceGUI's own Constructor, which nothing
+-- backdrop-related would be - so this hides titlebg directly, then any
+-- other texture region on frame whose anchor points back to it.
+local WINDOW_BORDER = {
+  bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+  edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+  tile = true, tileSize = 16, edgeSize = 16,
+  insets = { left = 3, right = 3, top = 3, bottom = 3 },
+}
+
+local function IsAnchoredTo(region, target)
+  for i = 1, region:GetNumPoints() do
+    local _, relativeTo = region:GetPoint(i)
+    if relativeTo == target then
+      return true
+    end
+  end
+  return false
+end
+
+local function ApplyTooltipWindowStyle(aceFrame)
+  if IsElvUILoaded() then return end
+
+  local frame = aceFrame.frame
+  frame:SetBackdrop(WINDOW_BORDER)
+
+  local titlebg = aceFrame.titlebg
+  titlebg:Hide()
+  for _, region in ipairs({ frame:GetRegions() }) do
+    if region:GetObjectType() == "Texture" and region ~= titlebg and IsAnchoredTo(region, titlebg) then
+      region:Hide()
+    end
+  end
+
+  -- .titletext was anchored 14px below the (now-hidden) banner's own top
+  -- edge, which itself sat 12px *above* the frame to match the banner
+  -- artwork's floating-tab shape - net result, only ~2px below the frame's
+  -- actual top edge, so without the banner the text sits right on top of
+  -- (or clipping into) the border instead of comfortably inside it.
+  -- Re-anchor it directly to the frame with real padding instead.
+  aceFrame.titletext:ClearAllPoints()
+  aceFrame.titletext:SetPoint("TOP", frame, "TOP", 0, -10)
+end
+ns.ApplyTooltipWindowStyle = ApplyTooltipWindowStyle
+
+-- AceGUI's Button widget exposes its text FontString directly as .text;
+-- shrink it relative to whatever size/font it already has rather than
+-- hardcoding a new one.
+--
+-- AceGUI recycles "Button" widgets, and a font size set via SetFont persists
+-- across that recycling (nothing resets it on Acquire) - callers like
+-- UI_Rosters.lua's roster list and UI_Groups.lua's composition list rebuild
+-- their buttons from scratch on every refresh, so without a guard this
+-- relative "-2 from whatever it currently is" would compound every single
+-- refresh, shrinking the same recycled widget smaller and smaller until the
+-- text vanished. The flag makes it apply at most once per underlying widget,
+-- no matter how many logical buttons reuse that widget over the session.
+local BUTTON_FONT_SHRINK = 2
+local function ShrinkButtonFont(btn)
+  if btn.riFontShrunk then return end
+  btn.riFontShrunk = true
+
+  local fontFile, size, fontFlags = btn.text:GetFont()
+  btn.text:SetFont(fontFile, size - BUTTON_FONT_SHRINK, fontFlags)
+end
+ns.ShrinkButtonFont = ShrinkButtonFont
+
+-- Blizzard's "Interface\QuestFrame\UI-QuestLogTitleHighlight" texture,
+-- gold-tinted (ADD blend mode's native color is a mostly-white glow, which
+-- reads as plain white/grey against this addon's darkened panels without an
+-- explicit tint) - used for the persistent "this row is selected" highlight
+-- bar in UI_Settings.lua's tab list and UI_Rosters.lua's roster list, plus
+-- btn's own built-in hover highlight (mimics the vertical category list in
+-- Blizzard's own Interface Options/AddOns list). Returns the persistent
+-- highlight texture, hidden by default - the caller shows/hides it to mark
+-- selection.
+local function ApplyGoldSelectionHighlight(btn)
+  local highlight = btn:CreateTexture(nil, "BACKGROUND")
+  highlight:SetTexture("Interface\\QuestFrame\\UI-QuestLogTitleHighlight")
+  highlight:SetBlendMode("ADD")
+  highlight:SetVertexColor(1, 0.82, 0)
+  highlight:SetAllPoints(btn)
+  highlight:Hide()
+
+  btn:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestLogTitleHighlight", "ADD")
+  btn:GetHighlightTexture():SetVertexColor(1, 0.82, 0)
+
+  return highlight
+end
+ns.ApplyGoldSelectionHighlight = ApplyGoldSelectionHighlight
+
+-- Vertically centers an AceGUI Label's text within a fixed height (padding
+-- above/below is however much taller `height` is than the label's own
+-- natural text height - the caller works that out).
+--
+-- A single SetHeight call right after creating the label isn't enough on
+-- its own: AceGUI's Label widget recalculates its own frame height from its
+-- FontString's *natural* text height every time its OnWidthSet fires (via
+-- UpdateImageAnchor internally), which tends to happen repeatedly for a
+-- label sitting in a list that gets rebuilt/relaid-out often (both the
+-- label's own row layout and an outer scrolling list's layout can each
+-- retrigger it), silently overwriting a one-off forced height back to the
+-- natural, unpadded one. Wrapping OnWidthSet to re-assert the padded height
+-- right after AceGUI's own logic runs is the one place proven to survive
+-- all of those passes, since it's the same hook responsible for undoing it
+-- in the first place.
+--
+-- Guarded (and undone in OnRelease) the same way ShrinkButtonFont above is -
+-- "Label" is a generic widget type AceGUI recycles for many unrelated
+-- purposes throughout this addon, so this must not still be forcing a
+-- padded height onto some other Label later.
+local function PadLabelVertically(aceLabel, height)
+  if not aceLabel.riPadded then
+    aceLabel.riPadded = true
+    aceLabel.label:SetJustifyV("MIDDLE")
+
+    local originalOnWidthSet = aceLabel.OnWidthSet
+    aceLabel.OnWidthSet = function(self, width)
+      originalOnWidthSet(self, width)
+      self.label:SetHeight(self.riPaddedHeight)
+      self.frame:SetHeight(self.riPaddedHeight)
+      self.frame.height = self.riPaddedHeight
+    end
+
+    aceLabel.OnRelease = function(self)
+      self.label:SetJustifyV("TOP")
+      self.OnWidthSet = originalOnWidthSet
+      self.riPadded = nil
+      self.riPaddedHeight = nil
+    end
+  end
+
+  aceLabel.riPaddedHeight = height
+  aceLabel.label:SetHeight(height)
+  aceLabel.frame:SetHeight(height)
+  aceLabel.frame.height = height
+end
+ns.PadLabelVertically = PadLabelVertically
+
+-- ChatFontNormal is Blizzard's own default chat text font (Fonts\ARIALN.TTF,
+-- i.e. Arial Narrow) - used in several places throughout this addon (player
+-- names, roster names, group slot/token text) instead of each widget's own
+-- default font, so names read the same as they do everywhere else names show
+-- up in chat. delta (typically negative) adjusts the size relative to
+-- ChatFontNormal's own default rather than hardcoding an absolute size.
+local function GetChatFont(delta)
+  local file, height, flags = ChatFontNormal:GetFont()
+  return file, height + (delta or 0), flags
+end
+ns.GetChatFont = GetChatFont
+
+----------------------------------------------------------------------
+-- Saved variables / defaults
+----------------------------------------------------------------------
+
+MakeIdiotsAppearDB = MakeIdiotsAppearDB or nil
+
+local function EnsureDB()
+  if not MakeIdiotsAppearDB then
+    MakeIdiotsAppearDB = {}
+  end
+
+  -- migrate old field names from earlier versions of the addon
+  if MakeIdiotsAppearDB.lists and not MakeIdiotsAppearDB.rosters then
+    MakeIdiotsAppearDB.rosters = MakeIdiotsAppearDB.lists
+    MakeIdiotsAppearDB.lists = nil
+  end
+
+  MakeIdiotsAppearDB.rosters = MakeIdiotsAppearDB.rosters or {}
+  MakeIdiotsAppearDB.masterRoster = MakeIdiotsAppearDB.masterRoster or {}   -- [lowercase name] = "Realm"
+  MakeIdiotsAppearDB.settings = MakeIdiotsAppearDB.settings or {}
+  MakeIdiotsAppearDB.windowStatus = MakeIdiotsAppearDB.windowStatus or {}   -- per-window {width, height, top, left}, see AceGUI's SetStatusTable
+  MakeIdiotsAppearDB.groupComps = MakeIdiotsAppearDB.groupComps or {}       -- [rosterName] = {activeComp=name, comps={{name=,groups={[1..8]={...}}}, ...}}, see GroupComps.lua
+  MakeIdiotsAppearDB.rosterGroupSizes = MakeIdiotsAppearDB.rosterGroupSizes or {} -- [rosterName] = 10|20|40, defaults to 20 when unset, see UI_Rosters.lua
+
+  local settings = MakeIdiotsAppearDB.settings
+  if settings.lastList and not settings.activeRoster then
+    settings.activeRoster = settings.lastList
+    settings.lastList = nil
+  end
+
+  settings.interval = settings.interval or 120
+  settings.messagePrefix = settings.messagePrefix or "[MIA]"
+  settings.delayAfterMessage = settings.delayAfterMessage or 5
+  if settings.sendGuildMessage == nil then
+    settings.sendGuildMessage = true
+  end
+  settings.guildMessage = settings.guildMessage
+      or "Starting raid invites, please watch for your invite!"
+  settings.whisperMessage = settings.whisperMessage
+      or "Please leave your current group so I can invite you to the raid. I'll try you again shortly."
+
+  if settings.durabilityWarningEnabled == nil then
+    settings.durabilityWarningEnabled = true
+  end
+  settings.durabilityThreshold = settings.durabilityThreshold or 80
+  settings.durabilityMessage = settings.durabilityMessage
+      or "WARNING: Your durability is at {percent}%. Please repair your gear."
+
+  if settings.debugMode == nil then
+    settings.debugMode = false
+  end
+
+  if settings.autoMasterLoot == nil then
+    settings.autoMasterLoot = false
+  end
+
+  if settings.autoLootThreshold == nil then
+    settings.autoLootThreshold = false
+  end
+  settings.lootThresholdQuality = settings.lootThresholdQuality or 3 -- Rare
+
+  if settings.autoPromoteMasterLooter == nil then
+    settings.autoPromoteMasterLooter = false
+  end
+  settings.masterLooterNames = settings.masterLooterNames or ""
+
+  if settings.autoPromoteAssist == nil then
+    settings.autoPromoteAssist = false
+  end
+  settings.assistNames = settings.assistNames or ""
+
+  if settings.activeRoster and not MakeIdiotsAppearDB.rosters[settings.activeRoster] then
+    settings.activeRoster = nil
+  end
+end
+ns.EnsureDB = EnsureDB
+
+local DEFAULT_ROSTER_GROUP_SIZE = 20
+ns.DEFAULT_ROSTER_GROUP_SIZE = DEFAULT_ROSTER_GROUP_SIZE
+
+-- Shared by UI_Rosters.lua (the picker itself) and UI_Main.lua (splitting a
+-- roster into its invited "main" portion vs. bench, see RefreshPlayerList).
+local function GetRosterGroupSize(name)
+  return (name and MakeIdiotsAppearDB.rosterGroupSizes[name]) or DEFAULT_ROSTER_GROUP_SIZE
+end
+ns.GetRosterGroupSize = GetRosterGroupSize
+
+----------------------------------------------------------------------
+-- Name normalization
+----------------------------------------------------------------------
+
+-- Known realm spellings -> proper case. Add more here if needed.
+local RealmMap = {
+  ["atiesh"]     = "Atiesh",
+  ["azuresong"]  = "Azuresong",
+  ["oldblanchy"] = "OldBlanchy",
+  ["myzrael"]    = "Myzrael",
+}
+
+local function trim(s)
+  return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
+ns.Trim = trim
+
+local function ProperCase(str)
+  if not str or str == "" then return str end
+  str = str:lower()
+  return str:sub(1, 1):upper() .. str:sub(2)
+end
+
+-- Returns: normalizedString, needsRealm (bool)
+-- normalizedString is "Name-Realm" if we could resolve a realm, otherwise just "Name".
+local function NormalizePlayerName(input)
+  input = trim(input or "")
+  if input == "" then return nil, false end
+
+  -- strip any accidental leading garbage like bullets/numbers "1. " etc.
+  input = input:gsub("^[%d%.%)%-%s]*", "", 1)
+  input = trim(input)
+  if input == "" then return nil, false end
+
+  local namePart, realmPart = input:match("^([^%-]+)%-(.+)$")
+  if not namePart then
+    namePart = input
+    realmPart = nil
+  end
+
+  namePart = ProperCase(trim(namePart))
+
+  local resolvedRealm = nil
+  if realmPart then
+    realmPart = trim(realmPart)
+    resolvedRealm = RealmMap[realmPart:lower()] or ProperCase(realmPart)
+  else
+    local known = MakeIdiotsAppearDB.masterRoster[namePart:lower()]
+    if known then
+      resolvedRealm = known
+    end
+  end
+
+  if resolvedRealm then
+    return namePart .. "-" .. resolvedRealm, false
+  else
+    return namePart, true
+  end
+end
+ns.NormalizePlayerName = NormalizePlayerName
+
+local function ParsePastedText(text)
+  local result = {}
+  for line in ((text or "") .. "\n"):gmatch("([^\r\n]*)[\r\n]") do
+    local t = trim(line)
+    if t ~= "" then
+      table.insert(result, t)
+    end
+  end
+  return result
+end
+ns.ParsePastedText = ParsePastedText
+
+-- Normalizes a whole list, returns cleaned array + array of names still needing a realm
+local function NormalizeList(rawLines)
+  local cleaned, needsRealm = {}, {}
+  for _, line in ipairs(rawLines) do
+    local norm, unresolved = NormalizePlayerName(line)
+    if norm then
+      table.insert(cleaned, norm)
+      if unresolved then
+        table.insert(needsRealm, norm)
+      end
+    end
+  end
+  return cleaned, needsRealm
+end
+ns.NormalizeList = NormalizeList
+
+local function NamePart(full)
+  return (full and full:match("^([^%-]+)") or full or ""):lower()
+end
+ns.NamePart = NamePart
+
+----------------------------------------------------------------------
+-- Master roster tracking (learn Name-Realm pairs from people who join)
+----------------------------------------------------------------------
+
+local function GetOwnRealm()
+  return (GetNormalizedRealmName and GetNormalizedRealmName()) or GetRealmName()
+end
+
+-- Same-name characters on different realms are different people. Anywhere
+-- we only have a bare name (no "-Realm" suffix) we assume our own realm,
+-- since that's true for group members and for most guild rosters - this
+-- keeps every lookup keyed on a full, unambiguous "Name-Realm" identity.
+local function ResolveFullName(name, realm)
+  if not name then return nil end
+  if name:find("%-") then return name end
+  if not realm or realm == "" then
+    realm = GetOwnRealm()
+  end
+  if not realm then return name end
+  return name .. "-" .. realm
+end
+ns.ResolveFullName = ResolveFullName
+
+local function GetFullUnitName(unit)
+  if not UnitExists(unit) then return nil end
+  local name, realm = UnitFullName(unit)
+  return ResolveFullName(name, realm)
+end
+ns.GetFullUnitName = GetFullUnitName
+
+local function RecordRosterUnit(unit)
+  local full = GetFullUnitName(unit)
+  if not full then return end
+  local name, realm = full:match("^(.-)%-(.+)$")
+  if name and realm then
+    MakeIdiotsAppearDB.masterRoster[name:lower()] = realm
+  end
+end
+
+local function ScanGroupRoster()
+  if IsInRaid() then
+    for i = 1, GetNumGroupMembers() do
+      RecordRosterUnit("raid" .. i)
+    end
+  elseif IsInGroup() then
+    RecordRosterUnit("player")
+    for i = 1, GetNumGroupMembers() - 1 do
+      RecordRosterUnit("party" .. i)
+    end
+  end
+end
+ns.ScanGroupRoster = ScanGroupRoster
+
+----------------------------------------------------------------------
+-- Live status helpers (group membership / guild online state)
+----------------------------------------------------------------------
+
+-- Keyed by full lowercased "name-realm" so two characters sharing a name on
+-- different realms are never confused for one another. Roster entries that
+-- (rarely) still lack a resolved realm fall back to a best-effort name-only
+-- match via LookupByFullOrName below - inherently ambiguous, but no worse
+-- than before.
+local function GetGroupNameSet()
+  local set = {}
+  local function record(unit)
+    local full = GetFullUnitName(unit)
+    if full then set[full:lower()] = full end
+  end
+
+  if IsInRaid() then
+    for i = 1, GetNumGroupMembers() do
+      record("raid" .. i)
+    end
+  elseif IsInGroup() then
+    record("player")
+    for i = 1, GetNumGroupMembers() - 1 do
+      record("party" .. i)
+    end
+  end
+  return set
+end
+ns.GetGroupNameSet = GetGroupNameSet
+
+-- Looks a roster entry up in a map keyed by full "name-realm" (as built by
+-- GetGroupNameSet/GetGuildOnlineMap/GetClassMap). Falls back to a name-only
+-- scan only when the roster entry itself has no resolved realm yet.
+local function LookupByFullOrName(map, fullName)
+  if not fullName then return nil end
+  local key = fullName:lower()
+  local value = map[key]
+  if value ~= nil then
+    return value
+  end
+  if key:find("%-") then
+    return nil
+  end
+  for mapKey, mapValue in pairs(map) do
+    if NamePart(mapKey) == key then
+      return mapValue
+    end
+  end
+  return nil
+end
+ns.LookupByFullOrName = LookupByFullOrName
+
+-- Several guild-roster functions moved from plain globals into the
+-- C_GuildInfo namespace in newer clients; fall back to the old global
+-- when the namespaced version isn't present (and vice versa).
+local function RequestGuildRoster()
+  if C_GuildInfo and C_GuildInfo.GuildRoster then
+    C_GuildInfo.GuildRoster()
+  elseif GuildRoster then
+    GuildRoster()
+  end
+end
+ns.RequestGuildRoster = RequestGuildRoster
+
+local function GetGuildOnlineMap()
+  local map = {}
+  if IsInGuild() then
+    local getNum = (C_GuildInfo and C_GuildInfo.GetNumGuildMembers) or GetNumGuildMembers
+    local getInfo = (C_GuildInfo and C_GuildInfo.GetGuildRosterInfo) or GetGuildRosterInfo
+    local numTotal = getNum and getNum() or 0
+    if getInfo then
+      for i = 1, numTotal do
+        local fullName, _, _, _, _, _, _, _, isOnline = getInfo(i)
+        local full = fullName and ResolveFullName(fullName)
+        if full then
+          map[full:lower()] = isOnline and true or false
+        end
+      end
+    end
+  end
+  return map
+end
+ns.GetGuildOnlineMap = GetGuildOnlineMap
+
+-- Class is only knowable for players we can currently see - our group, or
+-- our guild roster. Group data wins when both are available since it's live.
+-- Keyed by full "name-realm", same as GetGroupNameSet/GetGuildOnlineMap.
+local function GetClassMap()
+  local map = {}
+
+  local function record(unit)
+    local full = GetFullUnitName(unit)
+    if not full then return end
+    local _, classFile = UnitClass(unit)
+    if classFile then map[full:lower()] = classFile end
+  end
+
+  if IsInRaid() then
+    for i = 1, GetNumGroupMembers() do
+      record("raid" .. i)
+    end
+  elseif IsInGroup() then
+    record("player")
+    for i = 1, GetNumGroupMembers() - 1 do
+      record("party" .. i)
+    end
+  end
+
+  if IsInGuild() then
+    local getNum = (C_GuildInfo and C_GuildInfo.GetNumGuildMembers) or GetNumGuildMembers
+    local getInfo = (C_GuildInfo and C_GuildInfo.GetGuildRosterInfo) or GetGuildRosterInfo
+    local numTotal = getNum and getNum() or 0
+    if getInfo then
+      for i = 1, numTotal do
+        local fullName, _, _, _, _, _, _, _, _, _, classFileName = getInfo(i)
+        local full = fullName and ResolveFullName(fullName)
+        local key = full and full:lower()
+        if key and classFileName and not map[key] then
+          map[key] = classFileName
+        end
+      end
+    end
+  end
+
+  return map
+end
+ns.GetClassMap = GetClassMap
+
+-- C_ClassColor is the modern accessor; RAID_CLASS_COLORS is the classic
+-- global table. Try both so this works across client versions.
+local function GetClassColor(classFile)
+  if not classFile then return nil end
+  if C_ClassColor and C_ClassColor.GetClassColor then
+    local color = C_ClassColor.GetClassColor(classFile)
+    if color then
+      return color.r, color.g, color.b
+    end
+  end
+  local legacy = RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile]
+  if legacy then
+    return legacy.r, legacy.g, legacy.b
+  end
+  return nil
+end
+ns.GetClassColor = GetClassColor
+
+----------------------------------------------------------------------
+-- Invite engine
+----------------------------------------------------------------------
+
+local Engine = {
+  queue = {},          -- names left to invite in the current pass
+  fullRoster = {},     -- the complete set of names this invite run is trying to get grouped
+  running = false,
+  starting = false,
+  ticker = nil,
+  startTimer = nil,
+  durabilityTicker = nil, -- retries durability requests every few seconds as a backstop, see StartInvites
+  pendingInvites = {},   -- [lowercased "name-realm"] = fullName, currently invited but not yet confirmed
+  pendingInviteSentAt = {}, -- [lowercased "name-realm"] = GetTime() when that invite was sent
+  skipped = {},          -- names whispered this pass because they're already in another group, or still missing a realm
+  offlineThisPass = {},  -- names reported offline/nonexistent since the last batched report
+  nextPassAt = nil,      -- GetTime() timestamp of the next scheduled invite pass, if any
+  convertingToRaid = nil, -- true while waiting on a pending party->raid conversion
+  convertRetryCount = 0,  -- how many times we've waited on that conversion so far
+
+  -- Durability checks (see the LibDurability section below). Keyed by bare
+  -- lowercase name, not "name-realm" - LibDurability's wire protocol only
+  -- ever gives us a bare character name (via Ambiguate), so two same-named
+  -- characters on different realms can't be told apart here; this mirrors
+  -- the ambiguity the library itself imposes, not something we can avoid.
+  durabilityChecked = {},          -- [lowercase name] = true, already warned or found fine this run
+  durabilityPending = {},          -- [lowercase name] = fullName, joined and awaiting a durability reply this pass
+  durabilityUnknownThisPass = {},  -- fullNames whose check never got a reply before this pass ended
+}
+ns.Engine = Engine
+
+local listeners = {}
+local function FireStateChanged()
+  for _, fn in ipairs(listeners) do
+    fn()
+  end
+end
+ns.FireStateChanged = FireStateChanged
+
+function ns.RegisterListener(fn)
+  table.insert(listeners, fn)
+end
+
+local function CountPendingInvites()
+  local n = 0
+  for _ in pairs(Engine.pendingInvites) do
+    n = n + 1
+  end
+  return n
+end
+ns.CountPendingInvites = CountPendingInvites
+
+-- Engine.pendingInvites just tracks "we sent an invite and haven't heard
+-- back yet" - that's true just as much for an offline target waiting on
+-- its bounce-back message as for a real online invitee, so it's not enough
+-- on its own to justify a "Pending Invite" status. Only show that when we
+-- positively know they're online; a known-offline target always shows
+-- "Offline" instead, pending invite or not.
+local function ComputeStatus(fullName, groupSet, guildOnlineMap)
+  if LookupByFullOrName(groupSet, fullName) then
+    return "In Group"
+  end
+
+  local online = LookupByFullOrName(guildOnlineMap, fullName)
+
+  if online == false then
+    return "Offline"
+  end
+
+  if Engine.pendingInvites[fullName:lower()] and online == true then
+    return "Pending Invite"
+  end
+
+  if online == true then
+    return "Online"
+  end
+  return "-"
+end
+ns.ComputeStatus = ComputeStatus
+
+-- Seconds until the next scheduled invite pass (the initial post-message
+-- delay, or a retry pass for stragglers), or nil if nothing is scheduled.
+function ns.GetSecondsUntilNextPass()
+  if not Engine.running or not Engine.nextPassAt then
+    return nil
+  end
+  local remaining = Engine.nextPassAt - GetTime()
+  if remaining < 0 then remaining = 0 end
+  return math.floor(remaining + 0.5)
+end
+
+-- Some chat-sending APIs have moved namespaces across client versions (and
+-- may simply be missing/broken on a given build); try the modern one, fall
+-- back to the classic global, and never let a failure here propagate -
+-- a message we can't send should never be able to block the invite cycle.
+local function SendChat(message, chatType, target)
+  local sender = (C_ChatInfo and C_ChatInfo.SendChatMessage) or SendChatMessage
+  if not sender then
+    return false, "no SendChatMessage API available"
+  end
+  return pcall(sender, message, chatType, nil, target)
+end
+
+-- Prepends the user-configured prefix (e.g. "[MIA]") to every automated
+-- message. A blank prefix is how a user disables it, so an empty string is
+-- left as-is rather than falling back to any default.
+local function ApplyMessagePrefix(message)
+  local prefix = MakeIdiotsAppearDB.settings.messagePrefix
+  if prefix and prefix ~= "" then
+    return prefix .. " " .. message
+  end
+  return message
+end
+
+local function DoInvite(fullName)
+  if C_PartyInfo and C_PartyInfo.InviteUnit then
+    C_PartyInfo.InviteUnit(fullName)
+  else
+    InviteUnit(fullName)
+  end
+end
+
+-- One-off invite for a single bench player (see UI_Main.lua's "+" button on
+-- each bench row) - deliberately not routed through Engine.queue/StartInvites:
+-- bench players are excluded from the automated invite run on purpose, and
+-- this just needs the same realm-resolution/already-in-group checks
+-- RunInvitePass does for its own queue, not that pass's capacity/raid-
+-- conversion handling (a manual one-at-a-time click either succeeds or
+-- bounces off the game's own party-full response).
+local function InvitePlayerManually(fullName)
+  if not fullName:find("%-") then
+    local resolved = MakeIdiotsAppearDB.masterRoster[fullName:lower()]
+    if resolved then
+      fullName = fullName .. "-" .. resolved
+    else
+      print(PREFIX .. "Can't invite " .. fullName .. " - no realm on file yet. Add manually later.")
+      return
+    end
+  end
+
+  if LookupByFullOrName(GetGroupNameSet(), fullName) then
+    print(PREFIX .. fullName .. " is already in your group.")
+    return
+  end
+
+  local ok, err = pcall(DoInvite, fullName)
+  if ok then
+    print(PREFIX .. "Invited " .. fullName .. ".")
+  else
+    print(PREFIX .. "Could not invite " .. fullName .. " (" .. tostring(err) .. ").")
+  end
+end
+ns.InvitePlayerManually = InvitePlayerManually
+
+local function ConvertPartyToRaid()
+  if C_PartyInfo and C_PartyInfo.ConvertToRaid then
+    C_PartyInfo.ConvertToRaid()
+  elseif ConvertToRaid then
+    ConvertToRaid()
+  end
+end
+
+----------------------------------------------------------------------
+-- Durability checks (LibDurability)
+----------------------------------------------------------------------
+-- Vendored the same way as the AceGUI libs, so this works even for users
+-- without DBM/BigWigs installed - LibStub's version registry means our
+-- copy just silently steps aside if a newer one is already loaded.
+
+local LD = LibStub("LibDurability")
+
+local function FormatDurabilityWarning(template, percent)
+  return (template:gsub("{percent}", tostring(math.floor(percent + 0.5))))
+end
+
+-- Anyone still pending when a pass ends never replied in time (no
+-- LibDurability, an old version, or simply offline) - report them as one
+-- batched message rather than leaving the check hanging forever.
+local function ReportDurabilityUnknown()
+  for key, fullName in pairs(Engine.durabilityPending) do
+    DebugPrint(string.format("Timing out durability check for '%s' (key='%s') - never got a reply this pass.", fullName, key))
+    table.insert(Engine.durabilityUnknownThisPass, fullName)
+    Engine.durabilityPending[key] = nil
+  end
+  if #Engine.durabilityUnknownThisPass > 0 then
+    print(PREFIX .. "Durability could not be checked for: " .. table.concat(Engine.durabilityUnknownThisPass, ", "))
+    Engine.durabilityUnknownThisPass = {}
+  end
+end
+
+-- LibDurability reports names inconsistently: the library's own immediate
+-- self-report uses a bare name (UnitName("player")), but Ambiguate(sender,
+-- "none") for everyone else's reply turns out to still include the realm
+-- (confirmed empirically - "none" does not mean "no realm" here). Engine.
+-- durabilityPending is keyed by bare name only, so normalize whatever we
+-- got through NamePart before looking it up - safe no-op on an already-bare
+-- name, strips "-Realm" when present.
+LD:Register(ns, function(percent, broken, name, channel)
+  local key = NamePart(name)
+  local fullName = Engine.durabilityPending[key]
+
+  if MakeIdiotsAppearDB.settings.debugMode then
+    local pendingList = {}
+    for _, pendingName in pairs(Engine.durabilityPending) do
+      table.insert(pendingList, pendingName)
+    end
+    DebugPrint(string.format(
+        "Durability reply from '%s' (key='%s'): %d%%, matched=%s | currently pending: %s",
+        name, key, percent, tostring(fullName), #pendingList > 0 and table.concat(pendingList, ", ") or "(none)"))
+  end
+
+  if not fullName then return end
+
+  Engine.durabilityPending[key] = nil
+  Engine.durabilityChecked[key] = true
+
+  if percent < MakeIdiotsAppearDB.settings.durabilityThreshold then
+    local msg = ApplyMessagePrefix(FormatDurabilityWarning(MakeIdiotsAppearDB.settings.durabilityMessage, percent))
+    local ok, err = SendChat(msg, "WHISPER", fullName)
+    if not ok then
+      print(PREFIX .. "Could not send a durability warning to " .. fullName .. " (" .. tostring(err) .. ").")
+    end
+  end
+end)
+
+-- Called on every GROUP_ROSTER_UPDATE while a run is active (and on a
+-- short repeating ticker as a backstop - see StartInvites): queue a
+-- durability check for anyone currently in the group who hasn't been
+-- checked (warned, or found fine) yet this run. This deliberately checks
+-- everyone in the group, not just people on the active invite roster -
+-- someone can already be in the raid without being on the list (that's
+-- exactly what the "Not In List" row on the main window surfaces), and the
+-- whole point of this feature is catching bad durability on whoever's
+-- actually there.
+--
+-- Re-requests every time there's anyone still outstanding, not just when
+-- someone new joins this call: LibDurability throttles its own broadcast
+-- to once per 4 seconds per channel, so if an earlier request got dropped
+-- by that throttle (e.g. several people joined within the same window),
+-- nobody would ever ask again for whoever missed out - they'd just sit
+-- pending until the pass gives up and reports them as unknown.
+local function CheckNewlyJoinedDurability()
+  if not Engine.running or not MakeIdiotsAppearDB.settings.durabilityWarningEnabled then
+    return
+  end
+
+  local groupSet = GetGroupNameSet()
+  local ownFullName = GetFullUnitName("player")
+  local ownKey = ownFullName and NamePart(ownFullName)
+
+  for _, fullName in pairs(groupSet) do
+    local key = NamePart(fullName)
+    if key ~= ownKey and not Engine.durabilityChecked[key] and not Engine.durabilityPending[key] then
+      Engine.durabilityPending[key] = fullName
+      DebugPrint(string.format("Queuing durability check for '%s' (key='%s').", fullName, key))
+    end
+  end
+
+  if next(Engine.durabilityPending) then
+    LD:RequestDurability()
+  end
+end
+ns.CheckNewlyJoinedDurability = CheckNewlyJoinedDurability
+
+-- Offline/nonexistent targets are reported once, in a single batched
+-- message, instead of one print per person - see the CHAT_MSG_SYSTEM
+-- handler below, which appends to this list instead of printing directly.
+local function ReportOfflinePlayers()
+  if #Engine.offlineThisPass > 0 then
+    print(PREFIX .. "Players offline: " .. table.concat(Engine.offlineThisPass, ", "))
+    Engine.offlineThisPass = {}
+  end
+end
+
+local function StopInvites(reason)
+  if Engine.ticker then
+    Engine.ticker:Cancel()
+    Engine.ticker = nil
+  end
+  if Engine.startTimer then
+    Engine.startTimer:Cancel()
+    Engine.startTimer = nil
+  end
+  if Engine.durabilityTicker then
+    Engine.durabilityTicker:Cancel()
+    Engine.durabilityTicker = nil
+  end
+  Engine.running = false
+  Engine.starting = false
+  Engine.pendingInvites = {}
+  Engine.pendingInviteSentAt = {}
+  Engine.nextPassAt = nil
+  Engine.convertingToRaid = nil
+  Engine.convertRetryCount = 0
+  ReportOfflinePlayers()
+  ReportDurabilityUnknown()
+  Engine.durabilityChecked = {}
+  if reason then
+    print(PREFIX .. reason)
+  end
+  FireStateChanged()
+end
+ns.StopInvites = StopInvites
+
+-- Names from the full roster that are not currently in our raid/party -
+-- these are the only ones worth another pass.
+local function ComputeStragglers()
+  local groupSet = GetGroupNameSet()
+  local stragglers = {}
+  for _, name in ipairs(Engine.fullRoster) do
+    -- Skip anyone who still has one of our invites outstanding and not yet
+    -- expired (see PruneExpiredPendingInvites) - re-inviting them before
+    -- their first invite times out just duplicates it, and the resulting
+    -- bounce gets mistaken for a genuine "already in another group" case.
+    if not LookupByFullOrName(groupSet, name) and not LookupByFullOrName(Engine.pendingInvites, name) then
+      table.insert(stragglers, name)
+    end
+  end
+  return stragglers
+end
+
+-- Forward-declared so RunInvitePass can schedule a delayed continuation of
+-- itself (through the safe wrapper) after converting party -> raid.
+local RunInvitePass
+local SafeRunInvitePass
+
+-- Forward-declared so StartInvites (below) can run this once immediately
+-- when an invite pass begins - candidates already sitting in the raid
+-- before Start Invites was clicked would otherwise never trigger it, since
+-- its other call site only fires on the GROUP_ROSTER_UPDATE event, i.e. an
+-- actual roster change after that point.
+local MaybeAutoPromoteAssist
+
+-- Forward-declared so RunInvitePass (defined above the real body of this
+-- function) can call it - the real body needs ClearPendingInvite, which is
+-- only defined later alongside TakePendingInvite.
+local PruneExpiredPendingInvites
+
+-- Invites everyone currently queued, right now, back to back - no waiting
+-- between individual invites (up to whatever the group can currently hold -
+-- see the capacity check at the top of the loop below). Called once
+-- immediately when a run starts (so the whole roster goes out in one go),
+-- and again on each retry-pass tick for whoever's still missing.
+RunInvitePass = function()
+  PruneExpiredPendingInvites()
+
+  local groupSet = GetGroupNameSet()
+  local guildOnline = GetGuildOnlineMap()
+  local ownFullName = GetFullUnitName("player")
+
+  while #Engine.queue > 0 do
+    -- A party caps out at 5 total, and inviting past that requires being
+    -- a raid. The server reserves a slot for an invite the instant it's
+    -- sent, not once it's accepted - including while still completely
+    -- solo, before GetNumGroupMembers() ever leaves 0 - so yourself (at
+    -- least 1) plus every outstanding invite has to be counted against the
+    -- cap from the very first invite of a pass, not just once a party is
+    -- already confirmed to exist. Every invite immediately counts against
+    -- the cap alongside confirmed members - even to someone who turns out
+    -- to be offline - so pending invites have to be counted here too, not
+    -- just confirmed members, or we'd try to send a 3rd/4th/5th invite the
+    -- game has already reserved a full party against and have it bounce.
+    if not IsInRaid() then
+      local confirmedSize = math.max(GetNumGroupMembers(), 1)
+      if confirmedSize + CountPendingInvites() >= 5 then
+        Engine.convertRetryCount = Engine.convertRetryCount + 1
+        if Engine.convertRetryCount > 6 then
+          print(PREFIX .. "Could not convert to a raid automatically - please use /convert to raid manually, then click Start Invites again.")
+          Engine.convertingToRaid = nil
+          Engine.convertRetryCount = 0
+          FireStateChanged()
+          return
+        end
+
+        if not Engine.convertingToRaid then
+          Engine.convertingToRaid = true
+          print(PREFIX .. "Party is full - converting to a raid group so everyone can be invited.")
+          ConvertPartyToRaid()
+        end
+        FireStateChanged()
+        C_Timer.After(1.5, SafeRunInvitePass)
+        return
+      end
+    end
+    Engine.convertingToRaid = nil
+    Engine.convertRetryCount = 0
+
+    local nextName = table.remove(Engine.queue, 1)
+
+    if not nextName:find("%-") then
+      local resolved = MakeIdiotsAppearDB.masterRoster[nextName:lower()]
+      if resolved then
+        nextName = nextName .. "-" .. resolved
+      else
+        print(PREFIX .. "Skipping " .. nextName .. " - no realm on file yet. Add manually later.")
+        table.insert(Engine.skipped, nextName)
+        nextName = nil
+      end
+    end
+
+    if nextName and LookupByFullOrName(groupSet, nextName) then
+      -- already in our group, nothing to do
+      nextName = nil
+    end
+
+    if nextName and ownFullName and nextName:lower() == ownFullName:lower() then
+      -- never invite ourselves - we're on our own roster because we're a
+      -- raid member like anyone else, not because we need an invite
+      nextName = nil
+    end
+
+    -- A known-offline target still reserves a party slot the instant we
+    -- invite it - the server accepts the invite (and thus the reservation)
+    -- immediately, but the "player not found" bounce-back that would free
+    -- that slot again only arrives asynchronously, well after this
+    -- synchronous burst of invites has already finished. So burning a slot
+    -- on someone the guild roster already told us is offline can starve a
+    -- genuinely online target later in the same queue (see the "party is
+    -- full" bug this was fixed for). Skip the invite call entirely and
+    -- report them the same way a real bounce-back would.
+    if nextName and LookupByFullOrName(guildOnline, nextName) == false then
+      table.insert(Engine.skipped, nextName)
+      table.insert(Engine.offlineThisPass, nextName)
+      nextName = nil
+    end
+
+    if nextName then
+      local ok, err = pcall(DoInvite, nextName)
+      if ok then
+        Engine.pendingInvites[nextName:lower()] = nextName
+        Engine.pendingInviteSentAt[nextName:lower()] = GetTime()
+      else
+        print(PREFIX .. "Could not invite " .. nextName .. " (" .. tostring(err) .. "). Will retry next pass.")
+        table.insert(Engine.skipped, nextName)
+      end
+    end
+  end
+
+  FireStateChanged()
+
+  CheckNewlyJoinedDurability()
+  ReportOfflinePlayers()
+  ReportDurabilityUnknown()
+
+  -- this pass is done - see who's still not in the group and try again.
+  -- ComputeStragglers only returns people worth a fresh invite attempt right
+  -- now (it deliberately excludes anyone still holding one of our live,
+  -- unexpired invites - see ComputeStragglers) - so an empty stragglers list
+  -- does NOT necessarily mean everyone has joined, only that nobody needs a
+  -- new invite yet. Check actual group membership separately to decide
+  -- whether the run is really done.
+  local stragglers = ComputeStragglers()
+  local currentGroupSet = GetGroupNameSet()
+  local everyoneJoined = true
+  for _, name in ipairs(Engine.fullRoster) do
+    if not LookupByFullOrName(currentGroupSet, name) then
+      everyoneJoined = false
+      break
+    end
+  end
+
+  if everyoneJoined then
+    StopInvites("Invite list complete - everyone is in the group.")
+  elseif #stragglers > 0 then
+    Engine.queue = stragglers
+    Engine.skipped = {}
+    Engine.nextPassAt = GetTime() + MakeIdiotsAppearDB.settings.interval
+    print(PREFIX .. string.format(
+        "Pass complete. Retrying %d player(s) still not in the group in %ds.",
+        #stragglers, MakeIdiotsAppearDB.settings.interval))
+    FireStateChanged()
+  else
+    -- Nobody needs a fresh invite this pass - everyone still missing has one
+    -- of ours live and not yet expired. Keep the run alive (don't stop the
+    -- ticker) so the next scheduled pass can prune and retry once those
+    -- actually resolve, instead of ending the run while invites are still
+    -- genuinely outstanding.
+    Engine.queue = {}
+    Engine.skipped = {}
+    Engine.nextPassAt = GetTime() + MakeIdiotsAppearDB.settings.interval
+    print(PREFIX .. string.format(
+        "Pass complete. Waiting on %d still-pending invite(s), next check in %ds.",
+        CountPendingInvites(), MakeIdiotsAppearDB.settings.interval))
+    FireStateChanged()
+  end
+end
+
+-- RunInvitePass drives the whole run (both the initial call and every ticker
+-- firing). Nothing inside it should ever be able to kill the ticker, so any
+-- error we didn't anticipate (bad name, weird API failure, etc.) just gets
+-- logged instead of silently ending the invite cycle.
+SafeRunInvitePass = function()
+  if not Engine.running then return end
+  local ok, err = pcall(RunInvitePass)
+  if not ok then
+    print(PREFIX .. "Invite cycle hit an error, will retry next interval: " .. tostring(err))
+  end
+end
+ns.SafeRunInvitePass = SafeRunInvitePass
+
+local function StartInvites(list)
+  if #list == 0 then
+    print(PREFIX .. "Nothing to invite - the list is empty.")
+    return
+  end
+
+  Engine.queue = {}
+  Engine.fullRoster = {}
+  for _, n in ipairs(list) do
+    table.insert(Engine.queue, n)
+    table.insert(Engine.fullRoster, n)
+  end
+  Engine.skipped = {}
+  Engine.offlineThisPass = {}
+  Engine.convertingToRaid = nil
+  Engine.convertRetryCount = 0
+  Engine.durabilityChecked = {}
+  Engine.durabilityPending = {}
+  Engine.durabilityUnknownThisPass = {}
+  Engine.running = true
+  Engine.starting = true
+  FireStateChanged()
+
+  -- Catches assist candidates already sitting in a raid formed before Start
+  -- Invites was clicked - the GROUP_ROSTER_UPDATE-driven call further below
+  -- only fires on an actual roster change after this point, so it would
+  -- otherwise never see someone who was already there.
+  MaybeAutoPromoteAssist()
+
+  -- Backstop for durability checks: GROUP_ROSTER_UPDATE already triggers a
+  -- check whenever someone joins, but this catches anyone whose request
+  -- got dropped by LibDurability's own broadcast throttle.
+  if Engine.durabilityTicker then
+    Engine.durabilityTicker:Cancel()
+  end
+  Engine.durabilityTicker = C_Timer.NewTicker(5, CheckNewlyJoinedDurability)
+
+  local settings = MakeIdiotsAppearDB.settings
+
+  local function beginInviting()
+    Engine.starting = false
+    Engine.startTimer = nil
+    SafeRunInvitePass()
+    Engine.ticker = C_Timer.NewTicker(settings.interval, SafeRunInvitePass)
+    FireStateChanged()
+  end
+
+  if settings.sendGuildMessage and settings.guildMessage and settings.guildMessage ~= "" then
+    local ok, err = SendChat(ApplyMessagePrefix(settings.guildMessage), "GUILD")
+    if not ok then
+      print(PREFIX .. "Could not send the guild message (" .. tostring(err) .. "). Continuing anyway.")
+    end
+    if settings.delayAfterMessage and settings.delayAfterMessage > 0 then
+      Engine.nextPassAt = GetTime() + settings.delayAfterMessage
+      Engine.startTimer = C_Timer.NewTimer(settings.delayAfterMessage, beginInviting)
+    else
+      beginInviting()
+    end
+  else
+    beginInviting()
+  end
+end
+ns.StartInvites = StartInvites
+
+----------------------------------------------------------------------
+-- Invite failure detection via system chat message
+----------------------------------------------------------------------
+
+-- Build Lua patterns out of the localized global strings once.
+-- ERR_ALREADY_IN_GROUP_S looks like "%s is already in a group."
+-- ERR_BAD_PLAYER_NAME_S looks like "No player named '%s' is currently playing."
+-- (this is the message the server sends back for an offline/nonexistent target)
+local alreadyGroupedPattern
+if ERR_ALREADY_IN_GROUP_S then
+  alreadyGroupedPattern = "^" .. ERR_ALREADY_IN_GROUP_S:gsub("%%s", "(.+)") .. "$"
+end
+
+local playerNotFoundPattern
+if ERR_BAD_PLAYER_NAME_S then
+  playerNotFoundPattern = "^" .. ERR_BAD_PLAYER_NAME_S:gsub("%%s", "(.+)") .. "$"
+end
+
+-- ERR_DECLINE_GROUP_S looks like "%s declines your group invitation."
+local declinedPattern
+if ERR_DECLINE_GROUP_S then
+  declinedPattern = "^" .. ERR_DECLINE_GROUP_S:gsub("%%s", "(.+)") .. "$"
+end
+
+-- WoW group invites expire after 60s (confirmed by testing in-game) - add a
+-- 1s buffer, matching the same assumption RaidInviteClassic uses.
+local INVITE_EXPIRATION_SECONDS = 61
+
+-- Every place that clears a pendingInvites entry goes through here so
+-- pendingInviteSentAt (used to detect expiration - see
+-- PruneExpiredPendingInvites below) never drifts out of sync with it.
+local function ClearPendingInvite(key)
+  Engine.pendingInvites[key] = nil
+  Engine.pendingInviteSentAt[key] = nil
+end
+
+-- Multiple invites can be outstanding at once now, so a system message has to
+-- be matched against whichever of them it actually refers to, not a single
+-- "current" invitee. pendingInvites is keyed by full "name-realm" - if the
+-- message included a realm we get an exact, unambiguous match; if it only
+-- gave a bare name and more than one pending invite shares that name (e.g.
+-- Tanku-OldBlanchy and Tanku-Azuresong both outstanding), we can't tell
+-- which one it means, so we deliberately don't guess and leave both pending
+-- - the next retry pass will only re-invite whichever one still isn't
+-- actually in the group. Removes and returns the matching full name, if any.
+local function TakePendingInvite(shortName)
+  if not shortName then return nil end
+  local key = shortName:lower()
+
+  if Engine.pendingInvites[key] then
+    local fullName = Engine.pendingInvites[key]
+    ClearPendingInvite(key)
+    return fullName
+  end
+
+  if key:find("%-") then
+    return nil
+  end
+
+  local matchKey, matchFullName
+  for pendingKey, fullName in pairs(Engine.pendingInvites) do
+    if NamePart(fullName) == key then
+      if matchKey then
+        -- more than one candidate - ambiguous, don't guess
+        return nil
+      end
+      matchKey, matchFullName = pendingKey, fullName
+    end
+  end
+
+  if matchKey then
+    ClearPendingInvite(matchKey)
+    return matchFullName
+  end
+  return nil
+end
+
+-- Nobody clears a pendingInvites entry when the invite is simply accepted -
+-- there's no "so-and-so has joined" pattern among the CHAT_MSG_SYSTEM
+-- handlers below, only the already-grouped/not-found/declined bounce cases -
+-- so an accepted invite would otherwise sit "pending" forever, double-
+-- counting that person against the party cap (see RunInvitePass) and
+-- against the "Pending invites: N" label in the UI. Keys here are always
+-- full "name-realm" (see the only write site, in RunInvitePass), same as
+-- GetGroupNameSet()'s keys, so a plain key match is enough.
+local function PrunePendingInvites(groupSet)
+  for key in pairs(Engine.pendingInvites) do
+    if groupSet[key] then
+      ClearPendingInvite(key)
+    end
+  end
+end
+
+-- Backstop for invites that never resolve at all (no accept, no decline,
+-- nothing) - once the server's own ~60s invite window has passed, the
+-- reserved party slot is gone regardless of what we do, so stop counting it
+-- against the cap and make the person eligible for another invite attempt
+-- (see ComputeStragglers).
+PruneExpiredPendingInvites = function()
+  local now = GetTime()
+  for key, sentAt in pairs(Engine.pendingInviteSentAt) do
+    if now - sentAt > INVITE_EXPIRATION_SECONDS then
+      ClearPendingInvite(key)
+    end
+  end
+end
+
+----------------------------------------------------------------------
+-- Automatic master loot (Raid tab setting)
+----------------------------------------------------------------------
+
+-- SetLootMethod("master", raidIndex) wants the master looter's raid roster
+-- index, not a unit token - mirrors GroupComps.lua's FindRaidLeader, which
+-- resolves a raid index the same way rather than relying on UnitInRaid's
+-- historically inconsistent (0- vs 1-based) numbering.
+local function GetPlayerRaidIndex()
+  for i = 1, GetNumGroupMembers() do
+    if UnitIsUnit("raid" .. i, "player") then
+      return i
+    end
+  end
+  return nil
+end
+
+-- Below this size a master looter is rarely needed and round robin/group
+-- loot is the more common choice, so this only ever kicks in for larger
+-- raids - and only for whoever is actually leading it, since SetLootMethod
+-- is restricted to the party/raid leader anyway.
+local MASTER_LOOT_MIN_GROUP_SIZE = 10
+
+local function MaybeSetMasterLoot()
+  local settings = MakeIdiotsAppearDB.settings
+  if not settings.autoMasterLoot then return end
+  if not IsInRaid() then return end
+  if GetNumGroupMembers() <= MASTER_LOOT_MIN_GROUP_SIZE then return end
+  if not UnitIsGroupLeader("player") then return end
+  if GetLootMethod() == "master" then return end
+
+  local playerIndex = GetPlayerRaidIndex()
+  if not playerIndex then return end
+
+  SetLootMethod("master", playerIndex)
+end
+
+----------------------------------------------------------------------
+-- Automatic loot threshold (Raid tab setting)
+----------------------------------------------------------------------
+
+-- Must run after loot is set to Master Loot but before MaybeSetMasterLooter
+-- (below) hands master looter off to someone else - once that happens the
+-- raid leader can no longer change the threshold themselves, so this only
+-- ever tries while master looter is still un-promoted this raid.
+local function MaybeSetLootThreshold()
+  local settings = MakeIdiotsAppearDB.settings
+  if not settings.autoLootThreshold then return end
+  if Engine.masterLooterPromoted then return end
+  if not IsInRaid() then return end
+  if not UnitIsGroupLeader("player") then return end
+  if GetLootMethod() ~= "master" then return end
+  if GetLootThreshold() == settings.lootThresholdQuality then return end
+
+  -- Poor/Common (0/1) aren't thresholds Blizzard's own raid UI offers and
+  -- SetLootThreshold may reject them outright - pcall so a rejected value
+  -- here can't interrupt the rest of this pass.
+  pcall(SetLootThreshold, settings.lootThresholdQuality)
+end
+
+----------------------------------------------------------------------
+-- Automatic master looter promotion (Raid tab setting)
+----------------------------------------------------------------------
+
+-- One-shot per raid: once someone's been promoted this session we leave
+-- loot alone even if the user hands master looter to someone else by hand
+-- afterward - see MaybeSetMasterLooter below. Reset only when the player
+-- drops out of any group entirely (see the GROUP_ROSTER_UPDATE handler),
+-- so the next raid starts with a clean slate.
+Engine.masterLooterPromoted = false
+
+local function FindRaidIndexForFullName(fullName)
+  local target = fullName:lower()
+  for i = 1, GetNumGroupMembers() do
+    local full = GetFullUnitName("raid" .. i)
+    if full and full:lower() == target then
+      return i
+    end
+  end
+  return nil
+end
+
+-- Candidates are tried in order; the first one currently in the group gets
+-- promoted and we stop there for the rest of this raid (see
+-- Engine.masterLooterPromoted above) - later candidates, and any manual
+-- change the user makes afterward, are deliberately left alone.
+local function MaybeSetMasterLooter()
+  local settings = MakeIdiotsAppearDB.settings
+  if not settings.autoPromoteMasterLooter then return end
+  if Engine.masterLooterPromoted then return end
+  if not IsInRaid() then return end
+  if not UnitIsGroupLeader("player") then return end
+  if GetLootMethod() ~= "master" then return end
+
+  local groupSet = GetGroupNameSet()
+  for candidateName in (settings.masterLooterNames or ""):gmatch("%S+") do
+    local matchedFullName = LookupByFullOrName(groupSet, candidateName)
+    if matchedFullName then
+      local raidIndex = FindRaidIndexForFullName(matchedFullName)
+      if raidIndex then
+        SetLootMethod("master", raidIndex)
+        Engine.masterLooterPromoted = true
+      end
+      return
+    end
+  end
+end
+
+----------------------------------------------------------------------
+-- Automatic promote to assist (Raid tab setting)
+----------------------------------------------------------------------
+
+-- Gated on Engine.running/starting (an invite pass actually under way) so
+-- this never fires for a raid formed by hand that one of these players
+-- happens to join outside of that - unlike MaybeSetMasterLooter above,
+-- there's no one-shot flag here: every candidate still not an assistant
+-- gets promoted every time this runs, since simply being promoted already
+-- (checked via GetRaidRosterInfo's rank) makes each one idempotent.
+MaybeAutoPromoteAssist = function()
+  local settings = MakeIdiotsAppearDB.settings
+  if not settings.autoPromoteAssist then return end
+  if not (Engine.running or Engine.starting) then return end
+  if not IsInRaid() then return end
+  if not UnitIsGroupLeader("player") then return end
+
+  local groupSet = GetGroupNameSet()
+  for candidateName in (settings.assistNames or ""):gmatch("%S+") do
+    local matchedFullName = LookupByFullOrName(groupSet, candidateName)
+    if matchedFullName then
+      local raidIndex = FindRaidIndexForFullName(matchedFullName)
+      if raidIndex then
+        local _, rank = GetRaidRosterInfo(raidIndex)
+        if rank == 0 then
+          PromoteToAssistant("raid" .. raidIndex)
+        end
+      end
+    end
+  end
+end
+
+local eventFrame = CreateFrame("Frame")
+eventFrame:RegisterEvent("CHAT_MSG_SYSTEM")
+eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+eventFrame:RegisterEvent("GUILD_ROSTER_UPDATE")
+eventFrame:RegisterEvent("ADDON_LOADED")
+
+eventFrame:SetScript("OnEvent", function(self, event, ...)
+  if event == "ADDON_LOADED" then
+    local loaded = ...
+    if loaded == ADDON_NAME then
+      EnsureDB()
+      if IsInGuild() then RequestGuildRoster() end
+      FireStateChanged()
+    end
+    return
+  end
+
+  if event == "GROUP_ROSTER_UPDATE" then
+    if not IsInRaid() and not IsInGroup() then
+      Engine.masterLooterPromoted = false
+    end
+    ScanGroupRoster()
+    PrunePendingInvites(GetGroupNameSet())
+    CheckNewlyJoinedDurability()
+    ns.OnGroupRosterUpdateForApplyEngine()
+    MaybeSetMasterLoot()
+    MaybeSetLootThreshold()
+    MaybeSetMasterLooter()
+    MaybeAutoPromoteAssist()
+    FireStateChanged()
+    return
+  end
+
+  if event == "GUILD_ROSTER_UPDATE" then
+    FireStateChanged()
+    return
+  end
+
+  if event == "CHAT_MSG_SYSTEM" then
+    local msg = ...
+
+    if alreadyGroupedPattern then
+      local matched = msg:match(alreadyGroupedPattern)
+      local fullName = matched and TakePendingInvite(matched)
+      if fullName then
+        local whisperMsg = ApplyMessagePrefix(MakeIdiotsAppearDB.settings.whisperMessage)
+        local ok, err = SendChat(whisperMsg, "WHISPER", fullName)
+        if not ok then
+          print(PREFIX .. "Could not whisper " .. fullName .. " (" .. tostring(err) .. ").")
+        end
+        table.insert(Engine.skipped, fullName)
+        FireStateChanged()
+        return
+      end
+    end
+
+    if playerNotFoundPattern then
+      local matched = msg:match(playerNotFoundPattern)
+      local fullName = matched and TakePendingInvite(matched)
+      if fullName then
+        table.insert(Engine.skipped, fullName)
+        table.insert(Engine.offlineThisPass, fullName)
+        FireStateChanged()
+        return
+      end
+    end
+
+    if declinedPattern then
+      local matched = msg:match(declinedPattern)
+      local fullName = matched and TakePendingInvite(matched)
+      if fullName then
+        table.insert(Engine.skipped, fullName)
+        FireStateChanged()
+        return
+      end
+    end
+  end
+end)

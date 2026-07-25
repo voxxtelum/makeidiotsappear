@@ -1,0 +1,10 @@
+## Interface: 11509
+## Title: Make Idiots Appear
+## Notes: make idiots appear in your raid group
+## Author: goobygoobydo-oldblanchy
+## Version: @project-version@
+## SavedVariables: MakeIdiotsAppearDB
+## X-Category: Raid
+
+embeds.xml
+MakeIdiotsAppear.xml
