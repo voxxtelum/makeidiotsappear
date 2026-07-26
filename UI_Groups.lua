@@ -236,6 +236,30 @@ local function UpdateMissingIndicator(f, name, groupSet)
   end
 end
 
+-- Light grey "B" pinned to the right edge, shown only for roster entries
+-- past the roster's own group size (see ns.GetRosterGroupSize) - the same
+-- bench split UI_Main.lua's player list uses, mirrored here so bench players
+-- are still recognizable once they're dragged into/out of a group slot.
+local BENCH_MARKER_R, BENCH_MARKER_G, BENCH_MARKER_B = 0.6, 0.6, 0.6
+
+local function AddBenchMarker(f)
+  local marker = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  marker:SetPoint("RIGHT", f, "RIGHT", -4, 0)
+  marker:SetText("B")
+  marker:SetTextColor(BENCH_MARKER_R, BENCH_MARKER_G, BENCH_MARKER_B)
+  marker:Hide()
+  f.benchMarker = marker
+  return marker
+end
+
+local function UpdateBenchMarker(f, name, benchSet)
+  if name and benchSet[name:lower()] then
+    f.benchMarker:Show()
+  else
+    f.benchMarker:Hide()
+  end
+end
+
 -- Read-only, drag-source-only token used for the unassigned pool - matches
 -- MRT's "not in list" column, which is also just a drag source, never
 -- directly editable (only the main 40 group slots are, see
@@ -248,6 +272,7 @@ local function CreateTokenFrame(parent)
   AddBorderedBackground(f, 0.06, 0.06, 0.06, 0.9)
 
   AddMissingIndicator(f)
+  AddBenchMarker(f)
 
   -- ChatFontNormal is Blizzard's own default chat text font (Fonts\ARIALN.TTF,
   -- i.e. Arial Narrow) - used here instead of GameFontHighlightSmall so
@@ -364,6 +389,7 @@ local function CreateEditableSlot(parent)
   AddBorderedBackground(f, 0.06, 0.06, 0.06, 0.9)
 
   AddMissingIndicator(f)
+  AddBenchMarker(f)
 
   SetupDrag(f)
 
@@ -397,12 +423,13 @@ local function ResetSlotHome(slot)
   slot:SetFrameStrata(RESTING_STRATA)
 end
 
-local function SetTokenDisplay(frame, name, classMap, groupSet)
+local function SetTokenDisplay(frame, name, classMap, groupSet, benchSet)
   frame.text:SetText(name or "")
   if name then
     frame.text:SetTextColor(ComputeNameColor(name, classMap))
   end
   UpdateMissingIndicator(frame, name, groupSet)
+  UpdateBenchMarker(frame, name, benchSet)
 end
 
 -- Same idea as SetTokenDisplay, but for the editable EditBox-based group
@@ -412,7 +439,7 @@ end
 -- Color is applied via GetColoredFont/SetFontObject rather than
 -- SetTextColor - see the comment above CreateEditableSlot's font cache for
 -- why.
-local function SetSlotEditBoxDisplay(slot, name, classMap, groupSet)
+local function SetSlotEditBoxDisplay(slot, name, classMap, groupSet, benchSet)
   if slot:HasFocus() then
     return
   end
@@ -424,6 +451,7 @@ local function SetSlotEditBoxDisplay(slot, name, classMap, groupSet)
     slot:SetFontObject(SlotBaseFont)
   end
   UpdateMissingIndicator(slot, name, groupSet)
+  UpdateBenchMarker(slot, name, benchSet)
 end
 
 local function CreateGroupBox(parent, groupIndex, x, y)
@@ -640,6 +668,18 @@ local function DoRefreshGroupsWindow()
   local classMap = ns.GetClassMap()
   local groupSet = ns.GetGroupNameSet()
 
+  -- Bench = roster entries past the roster's own group size (see
+  -- ns.GetRosterGroupSize) - same split UI_Main.lua's player list uses,
+  -- keyed lower-case to match rosterKeys' own lookup convention in
+  -- ComputeUnassignedWithExtras below.
+  local groupSize = ns.GetRosterGroupSize(currentRosterName)
+  local benchSet = {}
+  for i, name in ipairs(rosterList) do
+    if i > groupSize then
+      benchSet[name:lower()] = true
+    end
+  end
+
   groupsFrame:SetTitle("Manage Groups - " .. currentRosterName)
 
   for g = 1, GROUPS_PER_COMP do
@@ -647,7 +687,7 @@ local function DoRefreshGroupsWindow()
     for p = 1, SLOTS_PER_GROUP do
       local slot = slotFrames[g][p]
       ResetSlotHome(slot)
-      SetSlotEditBoxDisplay(slot, list[p], classMap, groupSet)
+      SetSlotEditBoxDisplay(slot, list[p], classMap, groupSet, benchSet)
     end
   end
 
@@ -655,7 +695,7 @@ local function DoRefreshGroupsWindow()
   for i, name in ipairs(unassigned) do
     local token = AcquireUnassignedToken(i)
     token.playerName = name
-    SetTokenDisplay(token, name, classMap, groupSet)
+    SetTokenDisplay(token, name, classMap, groupSet, benchSet)
     token:ClearAllPoints()
     token:SetPoint("TOPLEFT", unassignedContent, "TOPLEFT", 0, -(i - 1) * (SLOT_HEIGHT + SLOT_GAP))
     token:Show()
