@@ -581,7 +581,12 @@ function EnsureCollapsedFrame()
   collapsedStartBtn.frame:SetParent(collapsedFrame)
   RaiseAboveParent(collapsedStartBtn.frame, collapsedFrame)
   collapsedStartBtn.frame:ClearAllPoints()
-  collapsedStartBtn.frame:SetPoint("BOTTOMRIGHT", collapsedFrame, "BOTTOMRIGHT", -4, 4)
+  -- Right edge sits 4px left of expandBtn's own left edge (expandBtn is
+  -- ICON_BUTTON_SIZE wide, anchored 4px in from collapsedFrame's right edge -
+  -- ICON_BUTTON_SIZE + 4 (expandBtn's margin) + 4 (this button's own margin)
+  -- clears it). Top edge sits at the box's vertical midpoint.
+  collapsedStartBtn.frame:SetPoint("TOPRIGHT", collapsedFrame, "TOPRIGHT",
+    -(ICON_BUTTON_SIZE + 8), -(BUTTON_HEIGHT * 3 / 2))
   collapsedStartBtn.frame:Show()
   collapsedStartBtn:SetCallback("OnClick", OnStartStopClick)
 
