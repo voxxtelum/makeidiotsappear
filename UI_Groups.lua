@@ -115,6 +115,21 @@ local function ResolveDropTarget(draggedFrame)
   return nil
 end
 
+-- Group-by-group, then position-within-group order (same as slotFrames'
+-- own layout) - used by the unassigned pool's right-click-to-place shortcut
+-- below, so "first empty spot" matches what a glance at the group grid
+-- itself would suggest.
+local function FindFirstEmptySlot(comp)
+  for g = 1, GROUPS_PER_COMP do
+    for p = 1, SLOTS_PER_GROUP do
+      if comp.groups[g][p] == nil then
+        return g, p
+      end
+    end
+  end
+  return nil
+end
+
 local function OnSlotDragStop(self)
   self:StopMovingOrSizing()
   self:SetFrameStrata(RESTING_STRATA)
@@ -325,6 +340,25 @@ local function CreateTokenFrame(parent)
 
   SetupTokenDrag(f)
 
+  -- Right-click shortcut: send this token straight into the first empty
+  -- group slot (see FindFirstEmptySlot), without having to drag it there.
+  -- Buttons only fire OnClick for clicks they're registered for - left is
+  -- on by default, right needs opting in explicitly.
+  f:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+  f:SetScript("OnClick", function(self, button)
+    if button ~= "RightButton" then
+      return
+    end
+    local comp = GetComp()
+    local g, p = FindFirstEmptySlot(comp)
+    if not g then
+      print(PREFIX .. "No empty group slot available.")
+      return
+    end
+    comp.groups[g][p] = self.playerName
+    RefreshGroupsWindow()
+  end)
+
   return f
 end
 
@@ -441,6 +475,25 @@ local function CreateEditableSlot(parent)
   end)
   f:SetScript("OnEditFocusLost", function(self)
     CommitSlotEdit(self)
+  end)
+
+  -- Right-click shortcut: send this slot's player straight back to
+  -- unassigned, without having to drag it there - same effect as dragging
+  -- the slot and dropping outside every group slot (see OnSlotDragStop).
+  -- EditBox has no OnClick/RegisterForClicks concept (that's Button-only) -
+  -- OnMouseUp fires for any button regardless, so this doesn't need it.
+  f:SetScript("OnMouseUp", function(self, button)
+    if button ~= "RightButton" then
+      return
+    end
+    self:ClearFocus()
+    local comp = GetComp()
+    local g, p = self.groupIndex, self.posIndex
+    if comp.groups[g][p] == nil then
+      return
+    end
+    comp.groups[g][p] = nil
+    RefreshGroupsWindow()
   end)
 
   return f
