@@ -523,7 +523,7 @@ local function BuildSettingsFrame()
     local fontPath, fontHeight, fontFlags = versionText:GetFont()
     versionText:SetFont(fontPath, fontHeight - 2, fontFlags)
   end
-  versionText:SetText("v" .. ns.GetAddonVersion())
+  versionText:SetText(ns.GetAddonVersion())
 
   SelectTab(selectedTabId)
 
