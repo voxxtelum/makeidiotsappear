@@ -80,6 +80,42 @@ local engineStatusSinks = {}
 local countdownSinks = {}
 local startStopButtons = {}
 
+-- Widgets created via AceGUI:Create and then reparented directly onto a
+-- native frame (rather than via :AddChild, which AceGUI itself keeps in
+-- sync) keep whatever frameStrata/frameLevel they were originally created
+-- with - SetParent alone does NOT inherit the new parent's strata/level.
+-- AceGUI's Button/Label widgets default to the WoW-standard "MEDIUM"
+-- strata, well below the "FULLSCREEN_DIALOG" strata this file's containers
+-- (SimpleGroup/InlineGroup/Frame) all explicitly set, so without this they
+-- render invisibly behind the window's own backdrop instead of on top of
+-- it. Also needed for the plain native icon buttons below, which have no
+-- explicit strata of their own at all until this runs.
+local function RaiseAboveParent(widgetFrame, parentFrame)
+  widgetFrame:SetFrameStrata(parentFrame:GetFrameStrata())
+  widgetFrame:SetFrameLevel(parentFrame:GetFrameLevel() + 10)
+end
+
+-- Plain native icon button (no AceGUI widget) - used for collapseBtn/
+-- expandBtn and the bench row's invite button. AceGUI's own Button widget
+-- is built on UIPanelButtonTemplate, whose text FontString is inset a fixed
+-- 15px from each edge (AceGUIWidget-Button.lua), leaving ~0px of room for
+-- text at small sizes; a plain icon sidesteps that entirely and reads more
+-- like a native control than a full bordered button anyway. iconName is
+-- "Minus" or "Plus"; textures confirmed valid on this client via
+-- AceGUIContainer-TreeGroup.lua's own tree-node expand/collapse toggle,
+-- which uses the identical assets. The highlight reuses the same -UP
+-- texture (additive blend, so hovering just brightens the icon) rather than
+-- the unverified "-Hilight" filename variants.
+local function CreateIconButton(parent, iconName, onClick)
+  local btn = CreateFrame("Button", nil, parent)
+  btn:SetSize(ICON_BUTTON_SIZE, ICON_BUTTON_SIZE)
+  btn:SetNormalTexture("Interface\\Buttons\\UI-" .. iconName .. "Button-UP")
+  btn:SetPushedTexture("Interface\\Buttons\\UI-" .. iconName .. "Button-DOWN")
+  btn:SetHighlightTexture("Interface\\Buttons\\UI-" .. iconName .. "Button-UP", "ADD")
+  btn:SetScript("OnClick", onClick)
+  return btn
+end
+
 local ROW_GAP = 2
 
 -- How many bench rows benchScroll always reserves room for (see
@@ -146,6 +182,17 @@ local function PrepareRow(row)
       self.frame.riRowBg:Hide()
       self.LayoutFinished = originalLayoutFinished
       self.riPrepared = nil
+      -- CreateBenchRow parents a plain native icon button directly onto
+      -- self.frame (see riInviteBtn there) rather than adding it via
+      -- :AddChild - since this same recycled frame can be handed out next
+      -- as any other row/spacer/button elsewhere in the addon, it has to be
+      -- detached here too, the same reasoning as riRowBg above. Checked
+      -- (rather than assumed set) since plain CreateRow rows never set it.
+      if self.frame.riInviteBtn then
+        self.frame.riInviteBtn:Hide()
+        self.frame.riInviteBtn:SetParent(UIParent)
+        self.frame.riInviteBtn = nil
+      end
     end
   end
 
@@ -200,11 +247,10 @@ local function CreateBenchRow(fullName, status, classMap)
   row:SetFullWidth(true)
   PrepareRow(row)
 
-  -- The three widths below (0.6 + 0.26 + 0.12 = 0.98) are deliberately
-  -- left under 1.0 for the same pixel-rounding reason as CreateRow's own
-  -- two columns, but closer to it than that - inviteBtn is small and needs
-  -- to sit close to the row's actual right edge, not just wherever
-  -- statusLabel happens to end.
+  -- The two widths below (0.6 + 0.26 = 0.86) are deliberately left under
+  -- 1.0 for the same pixel-rounding reason as CreateRow's own two columns -
+  -- inviteBtn sits in the remaining space at the row's actual right edge
+  -- (see below), positioned absolutely rather than via Flow.
   local nameLabel = AceGUI:Create("Label")
   nameLabel:SetRelativeWidth(0.6)
   nameLabel:SetFont(ROW_FONT_FILE, ROW_FONT_HEIGHT, ROW_FONT_FLAGS)
@@ -226,28 +272,23 @@ local function CreateBenchRow(fullName, status, classMap)
   statusLabel:SetColor(unpack(color))
   ns.PadLabelVertically(statusLabel, ROW_LABEL_HEIGHT)
 
-  local inviteBtn = AceGUI:Create("Button")
-  inviteBtn:SetRelativeWidth(0.12)
-  inviteBtn:SetHeight(ROW_LABEL_HEIGHT)
-  inviteBtn:SetText("+")
-  ns.ShrinkButtonFont(inviteBtn)
-  -- AceGUI's Button hardcodes 15px of padding on each side between its text
-  -- and the button's own edges (see AceGUIWidget-Button.lua's Constructor) -
-  -- fine at its normal ~200px default width, but that's more padding than
-  -- this whole button is wide, which is what actually made the "+" look
-  -- shrunk/squeezed rather than the font itself getting smaller. Reaching
-  -- into .text directly (exposed on the widget, same pattern as
-  -- leftGroup.titletext elsewhere) to use a much smaller inset instead.
-  inviteBtn.text:ClearAllPoints()
-  inviteBtn.text:SetPoint("TOPLEFT", 4, -1)
-  inviteBtn.text:SetPoint("BOTTOMRIGHT", -4, 1)
-  inviteBtn:SetCallback("OnClick", function()
+  -- Plain native icon button rather than an AceGUI Button (same technique
+  -- as collapseBtn/expandBtn - see CreateIconButton) - not added via
+  -- row:AddChild, so it's positioned absolutely at the row's right edge
+  -- instead of taking a Flow slice. Stashed as row.frame.riInviteBtn (rather
+  -- than just a local) so PrepareRow's OnRelease above can find and detach
+  -- it whenever this recycled row frame gets released - it isn't reachable
+  -- through AceGUI's own ReleaseChildren since it was never added via
+  -- :AddChild.
+  local inviteBtn = CreateIconButton(row.frame, "Plus", function()
     ns.InvitePlayerManually(fullName)
   end)
+  RaiseAboveParent(inviteBtn, row.frame)
+  inviteBtn:SetPoint("RIGHT", row.frame, "RIGHT", -4, 0)
+  row.frame.riInviteBtn = inviteBtn
 
   row:AddChild(nameLabel)
   row:AddChild(statusLabel)
-  row:AddChild(inviteBtn)
   return row
 end
 
@@ -468,38 +509,6 @@ StaticPopupDialogs["MAKEIDIOTSAPPEAR_CONFIRM_DISBAND_RAID"] = {
 local refreshTicker = nil
 local countdownTicker = nil
 
--- Widgets created via AceGUI:Create and then reparented directly onto a
--- native frame (rather than via :AddChild, which AceGUI itself keeps in
--- sync) keep whatever frameStrata/frameLevel they were originally created
--- with - SetParent alone does NOT inherit the new parent's strata/level.
--- AceGUI's Button/Label widgets default to the WoW-standard "MEDIUM"
--- strata, well below the "FULLSCREEN_DIALOG" strata both mainFrame and
--- collapsedFrame use, so without this they render invisibly behind the
--- window's own backdrop instead of on top of it.
-local function RaiseAboveParent(widgetFrame, parentFrame)
-  widgetFrame:SetFrameStrata(parentFrame:GetFrameStrata())
-  widgetFrame:SetFrameLevel(parentFrame:GetFrameLevel() + 10)
-end
-
--- Plain native icon button (no AceGUI widget) for collapseBtn/expandBtn -
--- AceGUI's own Button widget can't show short text at these sizes (see the
--- comment on the locals above), and a plain icon reads more like a
--- traditional minimize/maximize control than a full bordered button anyway.
--- iconName is "Minus" or "Plus"; textures confirmed valid on this client via
--- AceGUIContainer-TreeGroup.lua's own tree-node expand/collapse toggle,
--- which uses the identical assets. The highlight reuses the same -UP
--- texture (additive blend, so hovering just brightens the icon) rather than
--- the unverified "-Hilight" filename variants.
-local function CreateIconButton(parent, iconName, onClick)
-  local btn = CreateFrame("Button", nil, parent)
-  btn:SetSize(ICON_BUTTON_SIZE, ICON_BUTTON_SIZE)
-  btn:SetNormalTexture("Interface\\Buttons\\UI-" .. iconName .. "Button-UP")
-  btn:SetPushedTexture("Interface\\Buttons\\UI-" .. iconName .. "Button-DOWN")
-  btn:SetHighlightTexture("Interface\\Buttons\\UI-" .. iconName .. "Button-UP", "ADD")
-  btn:SetScript("OnClick", onClick)
-  return btn
-end
-
 -- Forward-declared as locals (rather than local function ... end, which
 -- would only create the local at the point of its own definition) so
 -- EnsureCollapsedFrame can reference ExpandMainWindow/OnStartStopClick as
@@ -598,7 +607,7 @@ function EnsureCollapsedFrame()
   collapsedCountdownLabel.frame:SetParent(collapsedFrame)
   RaiseAboveParent(collapsedCountdownLabel.frame, collapsedFrame)
   collapsedCountdownLabel.frame:ClearAllPoints()
-  collapsedCountdownLabel.frame:SetPoint("BOTTOM", collapsedStartBtn.frame, "TOP", 0, 0)
+  collapsedCountdownLabel.frame:SetPoint("BOTTOM", collapsedStartBtn.frame, "TOP", 0, 4)
   collapsedCountdownLabel.frame:Show()
 
   -- A single TOPLEFT anchor (rather than pinning all 4 sides) sidesteps
