@@ -829,6 +829,24 @@ local function DoRefreshGroupsWindow()
     applyBtn:SetDisabled(true)
     applyBtn:SetText("Applying...")
     applyStatusLabel:SetText("Moving players into place - this can take a few moments.")
+  elseif not IsInRaid() then
+    -- Mirrors ApplyGroupComposition's own "must be in a raid group" reject -
+    -- disabled up front instead of relying on that reject printing after the
+    -- click.
+    applyBtn:SetDisabled(true)
+    applyBtn:SetText("Apply Groups")
+    applyStatusLabel:SetText("")
+  elseif not (UnitIsGroupLeader("player") or UnitIsGroupAssistant("player")) then
+    -- Applying moves other players around via Set/SwapRaidSubgroup, which
+    -- silently fails server-side for anyone without raid leader/assist -
+    -- disabled here rather than letting it click through and do nothing.
+    applyBtn:SetDisabled(true)
+    applyBtn:SetText("Apply Groups")
+    applyStatusLabel:SetText("")
+  elseif ns.IsGroupCompInOrder(comp) then
+    applyBtn:SetDisabled(true)
+    applyBtn:SetText("All Groups in Order")
+    applyStatusLabel:SetText("")
   else
     applyBtn:SetDisabled(false)
     applyBtn:SetText("Apply Groups")

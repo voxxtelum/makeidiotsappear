@@ -257,8 +257,12 @@ local ApplyEngine = {
   needPosInGroup = nil,  -- [lowercased full name] = target position within that group
   lockedUnit = nil,      -- [lowercased full name] = true once its position swap has locked in
   groupsReady = false,   -- true once phase 1/2 (group placement) has converged
-  rlKey = nil,           -- lowercased full name of the current raid leader, if any
-  groupWithRL = nil,     -- the raid leader's current group, only set when the comp doesn't explicitly place them
+  rlKey = nil,           -- lowercased full name of the current raid leader, if any - excluded
+                         -- from needPosInGroup entirely (see ApplyGroupComposition) and never
+                         -- picked as a bridge/swap partner in phase 3 below, since Blizzard
+                         -- always forces the raid leader into position 1 of whatever group
+                         -- they're in regardless of what anyone (even a full-lead player)
+                         -- tries to do about it.
 }
 ns.GroupApplyEngine = ApplyEngine
 
@@ -286,6 +290,143 @@ local function FindRaidLeader()
   return nil
 end
 
+-- Snapshot of who's actually in the raid right now, keyed by lowercased full
+-- name: which subgroup they're in, and their position within it (assigned by
+-- raid-index order, not any roster/UI order). Shared by StepApplyEngine
+-- (which also needs nameToID, to actually move people) and IsGroupCompInOrder
+-- below (which only needs group/position, to compare against a composition).
+local function SnapshotRaidGroups()
+  local currentGroup, currentPos, nameToID, groupSize = {}, {}, {}, {}
+  for i = 1, GROUPS_PER_COMP do groupSize[i] = 0 end
+
+  for i = 1, GetNumGroupMembers() do
+    local unit = "raid" .. i
+    local full = ns.GetFullUnitName(unit)
+    if full then
+      local key = full:lower()
+      local _, _, subgroup = GetRaidRosterInfo(i)
+      if subgroup then
+        currentGroup[key] = subgroup
+        nameToID[key] = i
+        groupSize[subgroup] = groupSize[subgroup] + 1
+        currentPos[key] = groupSize[subgroup]
+      end
+    end
+  end
+  return currentGroup, currentPos, nameToID, groupSize
+end
+
+-- Builds the same needGroup/needPosInGroup maps ApplyGroupComposition sends
+-- to the apply engine, factored out so IsGroupCompInOrder below can reuse the
+-- walk over comp.groups without duplicating it.
+local function ComputeCompNeeds(comp)
+  local needGroup, needPosInGroup = {}, {}
+  for groupIndex = 1, GROUPS_PER_COMP do
+    for pos = 1, SLOTS_PER_GROUP do
+      local name = comp.groups[groupIndex][pos]
+      if name then
+        local key = name:lower()
+        needGroup[key] = groupIndex
+        needPosInGroup[key] = pos
+      end
+    end
+  end
+  return needGroup, needPosInGroup
+end
+
+-- True when every player this composition places is currently in the raid at
+-- exactly that group and (subject to the raid-leader exception below)
+-- position - i.e. applying it right now would be a no-op. A comp entry for
+-- someone not currently in the raid is ignored (same as StepApplyEngine's
+-- phases 1/2 silently skipping them above - there's nothing to apply for them
+-- either way), so a comp can still read as "in order" even while some of its
+-- players are missing from the raid, as long as everyone who IS in the raid
+-- is placed correctly.
+--
+-- Raid-leader exception: Blizzard always forces the raid leader into position
+-- 1 of whatever group they're in - not even a full-lead player can reorder
+-- them within a group, only move them to a different one entirely. So the
+-- leader's own position is never checked here, and every other member of
+-- their group is compared by *relative* order rather than absolute slot
+-- number, since the leader occupying a physical slot shifts everyone else's
+-- currentPos by however many slots ahead of them the leader sits.
+--
+-- No-bridge exception: StepApplyEngine's phase 3 (see its own comment above)
+-- can only fix a group's internal ordering by routing through a "bridge" -
+-- a real raid member currently in a DIFFERENT group. If the whole raid is
+-- currently crammed into a single group, no such bridge exists anywhere and
+-- that group's order can never actually be fixed by Apply Groups - so rather
+-- than reporting "out of order" for something clicking Apply could never
+-- resolve (which just repeats the same "no one outside their group to
+-- temporarily swap through" failure every time), that group's internal
+-- order is skipped here too, same as the leader's own position is.
+function ns.IsGroupCompInOrder(comp)
+  local needGroup, needPosInGroup = ComputeCompNeeds(comp)
+  if not next(needGroup) then
+    return false
+  end
+
+  local currentGroup, currentPos = SnapshotRaidGroups()
+  local rlFullName = FindRaidLeader()
+  local rlKey = rlFullName and rlFullName:lower()
+
+  local occupiedGroups = {}
+  for _, g in pairs(currentGroup) do
+    occupiedGroups[g] = true
+  end
+
+  local compGroups = {}
+  for key, targetGroup in pairs(needGroup) do
+    compGroups[targetGroup] = compGroups[targetGroup] or {}
+    table.insert(compGroups[targetGroup], key)
+  end
+
+  for targetGroup, keys in pairs(compGroups) do
+    for _, key in ipairs(keys) do
+      if currentGroup[key] and currentGroup[key] ~= targetGroup then
+        return false
+      end
+    end
+
+    local hasBridge = false
+    for g in pairs(occupiedGroups) do
+      if g ~= targetGroup then
+        hasBridge = true
+        break
+      end
+    end
+
+    -- No bridge exists for this group - its internal order can never be
+    -- fixed by Apply Groups (see the function comment above), so it's exempt
+    -- from the order check entirely; group placement (already checked above)
+    -- is all that matters for it.
+    if hasBridge then
+      table.sort(keys, function(a, b) return needPosInGroup[a] < needPosInGroup[b] end)
+
+      local compOrder = {}
+      for _, key in ipairs(keys) do
+        if key ~= rlKey and currentGroup[key] == targetGroup then
+          table.insert(compOrder, key)
+        end
+      end
+
+      local actualOrder = {}
+      for _, key in ipairs(compOrder) do
+        table.insert(actualOrder, key)
+      end
+      table.sort(actualOrder, function(a, b) return currentPos[a] < currentPos[b] end)
+
+      for i, key in ipairs(compOrder) do
+        if actualOrder[i] ~= key then
+          return false
+        end
+      end
+    end
+  end
+
+  return true
+end
+
 local function StopApplyEngine(reason)
   if stepTimer then
     stepTimer:Cancel()
@@ -297,7 +438,6 @@ local function StopApplyEngine(reason)
   ApplyEngine.lockedUnit = nil
   ApplyEngine.groupsReady = false
   ApplyEngine.rlKey = nil
-  ApplyEngine.groupWithRL = nil
   if reason then
     print(PREFIX .. reason)
   end
@@ -319,24 +459,7 @@ function ns.StepApplyEngine()
   local lockedUnit = ApplyEngine.lockedUnit
   if not needGroup then return end
 
-  -- Snapshot of who's actually in the raid right now, and where.
-  local currentGroup, currentPos, nameToID, groupSize = {}, {}, {}, {}
-  for i = 1, GROUPS_PER_COMP do groupSize[i] = 0 end
-
-  for i = 1, GetNumGroupMembers() do
-    local unit = "raid" .. i
-    local full = ns.GetFullUnitName(unit)
-    if full then
-      local key = full:lower()
-      local _, _, subgroup = GetRaidRosterInfo(i)
-      if subgroup then
-        currentGroup[key] = subgroup
-        nameToID[key] = i
-        groupSize[subgroup] = groupSize[subgroup] + 1
-        currentPos[key] = groupSize[subgroup]
-      end
-    end
-  end
+  local currentGroup, currentPos, nameToID, groupSize = SnapshotRaidGroups()
 
   if not ApplyEngine.groupsReady then
     -- Phase 1: move anyone whose current group is wrong into their target
@@ -378,31 +501,20 @@ function ns.StepApplyEngine()
   end
 
   -- Phase 3: everyone's in the correct group now - fix ordering within each
-  -- group. The raid leader is only protected from being moved/swapped here
-  -- when the comp DIDN'T explicitly place them (groupWithRL set) - in that
-  -- case everyone else landing in the leader's untouched group has their
-  -- target position bumped by 1 to leave the leader's slot alone. If the
-  -- comp DID explicitly assign the leader a slot, they're repositioned like
-  -- anyone else - otherwise a full group that happens to include the leader
-  -- could never finish reordering (nothing else could ever swap into the
-  -- leader's slot to complete the permutation).
-  local skipRL = ApplyEngine.groupWithRL ~= nil
-  local function IsLockedRL(key)
-    return skipRL and key == ApplyEngine.rlKey
-  end
-
+  -- group. The raid leader never has a needPosInGroup entry to begin with
+  -- (see ApplyGroupComposition - Blizzard always forces them into position 1
+  -- of whatever group they're in, no matter what anyone tries), so this loop
+  -- never attempts to reposition them; they're also excluded here from ever
+  -- being picked as someone else's bridge or swap-target, since forcing them
+  -- into a temporary slot wouldn't behave like a normal member's move would.
   local swappedOut = {}
   local anyUnresolved = false
-  for key, wantedPos in pairs(needPosInGroup) do
-    local pos = wantedPos
-    if currentGroup[key] == ApplyEngine.groupWithRL then
-      pos = pos + 1
-    end
+  for key, pos in pairs(needPosInGroup) do
     if not lockedUnit[key] and currentPos[key] and currentPos[key] ~= pos
-        and not IsLockedRL(key) and not swappedOut[key] then
+        and key ~= ApplyEngine.rlKey and not swappedOut[key] then
       local bridgeKey
       for key2, group2 in pairs(currentGroup) do
-        if group2 ~= currentGroup[key] and not IsLockedRL(key2) and not swappedOut[key2] then
+        if group2 ~= currentGroup[key] and key2 ~= ApplyEngine.rlKey and not swappedOut[key2] then
           bridgeKey = key2
           break
         end
@@ -411,7 +523,7 @@ function ns.StepApplyEngine()
       local swapKey
       for key2, pos2 in pairs(currentPos) do
         if currentGroup[key2] == currentGroup[key] and pos2 == pos
-            and not IsLockedRL(key2) and not swappedOut[key2] then
+            and key2 ~= ApplyEngine.rlKey and not swappedOut[key2] then
           swapKey = key2
           break
         end
@@ -475,25 +587,38 @@ function ns.ApplyGroupComposition(comp)
   local rlFullName, rlGroup = FindRaidLeader()
   local rlKey = rlFullName and rlFullName:lower()
 
-  local needGroup, needPosInGroup = {}, {}
-  local rlPlaced = false
-
   -- needPosInGroup uses the composition's own slot index (1-5) directly,
   -- not a compacted counter - a blank slot 3 with someone in slot 4 means
   -- position 4 is genuinely what gets requested for them, preserving
   -- exactly how the groups were arranged in the editor.
-  for groupIndex = 1, GROUPS_PER_COMP do
-    for pos = 1, SLOTS_PER_GROUP do
-      local name = comp.groups[groupIndex][pos]
-      if name then
-        local key = name:lower()
-        if rlKey and key == rlKey then
-          rlPlaced = true
-        end
-        needGroup[key] = groupIndex
-        needPosInGroup[key] = pos
+  local needGroup, needPosInGroup = ComputeCompNeeds(comp)
+
+  -- Blizzard always forces the raid leader into position 1 of whatever group
+  -- they're in - not even a full-lead player can reorder them within a group
+  -- (see ns.IsGroupCompInOrder's matching comment). So the leader is never
+  -- given a target position of their own (phase 3 above skips anyone without
+  -- a needPosInGroup entry), and everyone else headed for the leader's group
+  -- is renumbered 2-5 by their *relative* comp order - reserving slot 1 for
+  -- the leader regardless of what raw slot number the comp actually gave
+  -- them - rather than by their raw comp slot number, which would otherwise
+  -- assume slot 1 is reachable. rlTargetGroup covers both cases the same
+  -- way: wherever the comp explicitly places the leader, or (if it doesn't)
+  -- wherever they currently already are, since nothing here will move them.
+  local rlTargetGroup = rlKey and (needGroup[rlKey] or rlGroup) or nil
+  if rlTargetGroup then
+    local others = {}
+    for key, g in pairs(needGroup) do
+      if g == rlTargetGroup and key ~= rlKey then
+        table.insert(others, key)
       end
     end
+    table.sort(others, function(a, b)
+      return (needPosInGroup[a] or math.huge) < (needPosInGroup[b] or math.huge)
+    end)
+    for i, key in ipairs(others) do
+      needPosInGroup[key] = i + 1
+    end
+    needPosInGroup[rlKey] = nil
   end
 
   if not next(needGroup) then
@@ -506,7 +631,6 @@ function ns.ApplyGroupComposition(comp)
   ApplyEngine.lockedUnit = {}
   ApplyEngine.groupsReady = false
   ApplyEngine.rlKey = rlKey
-  ApplyEngine.groupWithRL = (rlKey and not rlPlaced) and rlGroup or nil
   ApplyEngine.pending = true
   ns.FireStateChanged()
 
