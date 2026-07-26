@@ -238,6 +238,7 @@ local function AddBorderedBackground(f, r, g, b, a)
   SetTextureColor(fill, r, g, b, a)
   return fill
 end
+ns.AddBorderedBackground = AddBorderedBackground
 
 -- Class color, always - no longer conditional on raid/party membership (see
 -- MissingIndicatorWidth/UpdateMissingIndicator below for how "not currently

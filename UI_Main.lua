@@ -54,6 +54,32 @@ local leftGroup, playerScroll, engineStatusLabel, countdownLabel, startBtn
 local lootThresholdBtn, lootThresholdDropdown, disbandBtn
 local benchLabel, benchScroll
 
+-- Collapse/expand: collapsedFrame is a plain native frame (not an AceGUI
+-- container - see EnsureCollapsedFrame) shown in place of mainFrame while
+-- collapsed. collapseBtn/expandBtn are small minimize/maximize-style icon
+-- buttons (see CreateIconButton) rather than AceGUI Buttons - AceGUI's
+-- Button widget is built on UIPanelButtonTemplate, whose text FontString is
+-- inset a fixed 15px from each edge (AceGUIWidget-Button.lua), which left no
+-- room at all for text at the small sizes tried here. COLLAPSED_BUTTON_WIDTH
+-- is a separate, unrelated approximation for the collapsed bar's own
+-- Start/Stop Invites button, which doesn't need to match the main window's
+-- button pixel-for-pixel.
+local collapsedFrame = nil
+local collapseBtn, expandBtn, collapsedStartBtn
+local collapsedEngineStatusLabel, collapsedCountdownLabel
+local COLLAPSED_BUTTON_WIDTH = 100
+local BUTTON_HEIGHT = 20
+local ICON_BUTTON_SIZE = 16
+local MAIN_FRAME_WIDTH = 440
+
+-- Refreshed together by RefreshEngineStatus/RefreshCountdown so whichever of
+-- mainFrame/collapsedFrame is showing (or about to be shown) always has
+-- current text, without either function needing to know which one is
+-- visible right now.
+local engineStatusSinks = {}
+local countdownSinks = {}
+local startStopButtons = {}
+
 local ROW_GAP = 2
 
 -- How many bench rows benchScroll always reserves room for (see
@@ -371,32 +397,37 @@ local function RefreshPlayerList()
   benchScroll:SetScroll(savedBenchScroll)
 end
 
+-- Updates every sink in engineStatusSinks/startStopButtons/countdownSinks
+-- (both mainFrame's and, once built, collapsedFrame's widgets) rather than a
+-- single hardcoded widget - so whichever window is showing (or about to be
+-- shown via Expand/Collapse) always already has current text, with no
+-- "which window is visible" branching needed here.
 local function RefreshEngineStatus()
+  local statusText, buttonText
   if Engine.starting then
-    engineStatusLabel:SetText("Starting invites shortly...")
-    startBtn:SetText("Stop Invites")
+    statusText = "Starting invites shortly..."
+    buttonText = "Stop Invites"
   elseif Engine.running then
-    engineStatusLabel:SetText(string.format(
+    statusText = string.format(
       "Running. Pending invites: %d | Queued for next pass: %d | Whispered/skipped: %d",
-      ns.CountPendingInvites(), #Engine.queue, #Engine.skipped))
-    startBtn:SetText("Stop Invites")
+      ns.CountPendingInvites(), #Engine.queue, #Engine.skipped)
+    buttonText = "Stop Invites"
   else
     local skippedNote = ""
     if #Engine.skipped > 0 then
       skippedNote = " | Needs follow-up: " .. table.concat(Engine.skipped, ", ")
     end
-    engineStatusLabel:SetText("Idle." .. skippedNote)
-    startBtn:SetText("Start Invites")
+    statusText = "Idle." .. skippedNote
+    buttonText = "Start Invites"
   end
+  for _, label in ipairs(engineStatusSinks) do label:SetText(statusText) end
+  for _, btn in ipairs(startStopButtons) do btn:SetText(buttonText) end
 end
 
 local function RefreshCountdown()
   local seconds = ns.GetSecondsUntilNextPass()
-  if seconds then
-    countdownLabel:SetText(string.format("Next invites: %ds", seconds))
-  else
-    countdownLabel:SetText("")
-  end
+  local text = seconds and string.format("Next invites: %ds", seconds) or ""
+  for _, label in ipairs(countdownSinks) do label:SetText(text) end
 end
 
 -- Only :Show()/:Hide()s the button/dropdown/disband button rather than
@@ -437,10 +468,207 @@ StaticPopupDialogs["MAKEIDIOTSAPPEAR_CONFIRM_DISBAND_RAID"] = {
 local refreshTicker = nil
 local countdownTicker = nil
 
+-- Widgets created via AceGUI:Create and then reparented directly onto a
+-- native frame (rather than via :AddChild, which AceGUI itself keeps in
+-- sync) keep whatever frameStrata/frameLevel they were originally created
+-- with - SetParent alone does NOT inherit the new parent's strata/level.
+-- AceGUI's Button/Label widgets default to the WoW-standard "MEDIUM"
+-- strata, well below the "FULLSCREEN_DIALOG" strata both mainFrame and
+-- collapsedFrame use, so without this they render invisibly behind the
+-- window's own backdrop instead of on top of it.
+local function RaiseAboveParent(widgetFrame, parentFrame)
+  widgetFrame:SetFrameStrata(parentFrame:GetFrameStrata())
+  widgetFrame:SetFrameLevel(parentFrame:GetFrameLevel() + 10)
+end
+
+-- Plain native icon button (no AceGUI widget) for collapseBtn/expandBtn -
+-- AceGUI's own Button widget can't show short text at these sizes (see the
+-- comment on the locals above), and a plain icon reads more like a
+-- traditional minimize/maximize control than a full bordered button anyway.
+-- iconName is "Minus" or "Plus"; textures confirmed valid on this client via
+-- AceGUIContainer-TreeGroup.lua's own tree-node expand/collapse toggle,
+-- which uses the identical assets. The highlight reuses the same -UP
+-- texture (additive blend, so hovering just brightens the icon) rather than
+-- the unverified "-Hilight" filename variants.
+local function CreateIconButton(parent, iconName, onClick)
+  local btn = CreateFrame("Button", nil, parent)
+  btn:SetSize(ICON_BUTTON_SIZE, ICON_BUTTON_SIZE)
+  btn:SetNormalTexture("Interface\\Buttons\\UI-" .. iconName .. "Button-UP")
+  btn:SetPushedTexture("Interface\\Buttons\\UI-" .. iconName .. "Button-DOWN")
+  btn:SetHighlightTexture("Interface\\Buttons\\UI-" .. iconName .. "Button-UP", "ADD")
+  btn:SetScript("OnClick", onClick)
+  return btn
+end
+
+-- Forward-declared as locals (rather than local function ... end, which
+-- would only create the local at the point of its own definition) so
+-- EnsureCollapsedFrame can reference ExpandMainWindow/OnStartStopClick as
+-- upvalues before they're assigned below - all of these are only ever
+-- actually called later, via user interaction, by which point every local
+-- here has been assigned once the file finishes loading.
+local OnStartStopClick, HideMainFrameWithoutClosing, EnsureCollapsedFrame, CollapseMainWindow, ExpandMainWindow
+
+function OnStartStopClick()
+  if Engine.running or Engine.starting then
+    ns.StopInvites("Stopped by user.")
+    return
+  end
+
+  local activeRoster = MakeIdiotsAppearDB.settings.activeRoster
+  if not activeRoster then
+    print(PREFIX .. "No active roster selected. Use Manage Rosters to create/select one first.")
+    return
+  end
+
+  -- Bench players (past the roster's own group size, see
+  -- ns.GetRosterGroupSize) are deliberately excluded from the automated
+  -- run - they're only invited manually via the "+" button on their own
+  -- bench row.
+  local fullList = MakeIdiotsAppearDB.rosters[activeRoster] or {}
+  local groupSize = ns.GetRosterGroupSize(activeRoster)
+  local list = {}
+  for i = 1, math.min(groupSize, #fullList) do
+    table.insert(list, fullList[i])
+  end
+  ns.StartInvites(list)
+end
+
+-- mainFrame.frame's OnHide script fires AceGUI's own "OnClose" (see
+-- Frame_OnClose in AceGUIContainer-Frame.lua), which this file's OnClose
+-- callback below uses to cancel refreshTicker/countdownTicker and release
+-- mainFrame entirely - appropriate for a real window close, but collapsing
+-- must hide the frame without any of that. Detaching the script around the
+-- Hide() call is what makes the two distinguishable.
+function HideMainFrameWithoutClosing()
+  local nativeFrame = mainFrame.frame
+  local onHide = nativeFrame:GetScript("OnHide")
+  nativeFrame:SetScript("OnHide", nil)
+  nativeFrame:Hide()
+  nativeFrame:SetScript("OnHide", onHide)
+end
+
+-- Built lazily on the first Collapse click (mirrors mainFrame's own
+-- lazy-build-on-first-use pattern in ToggleMainFrame below). A plain native
+-- frame rather than an AceGUI "Frame"/"Window" container - both of those
+-- force ~57px of mandatory chrome (a hardcoded CLOSE button, resize
+-- sizers) that has nowhere sensible to go in a 3-button-tall bar.
+function EnsureCollapsedFrame()
+  if collapsedFrame then return end
+
+  collapsedFrame = CreateFrame("Frame", nil, UIParent)
+  collapsedFrame:SetSize(MAIN_FRAME_WIDTH, BUTTON_HEIGHT * 3)
+  collapsedFrame:SetFrameStrata("FULLSCREEN_DIALOG")
+  collapsedFrame:SetToplevel(true)
+  -- SetBackdrop on a plain CreateFrame("Frame", ...) (no "BackdropTemplate")
+  -- is unavailable on at least some Classic Era clients (see UI_Groups.lua's
+  -- own AddBorderedBackground comment, hit via this exact same error there)
+  -- - reuse that same stacked-texture border trick instead of SetBackdrop.
+  ns.AddBorderedBackground(collapsedFrame, 0.06, 0.06, 0.06, 0.9)
+  collapsedFrame:SetMovable(true)
+  collapsedFrame:EnableMouse(true)
+  collapsedFrame:SetScript("OnMouseDown", function(self) self:StartMoving() end)
+  collapsedFrame:SetScript("OnMouseUp", function(self) self:StopMovingOrSizing() end)
+  collapsedFrame:Hide()
+
+  expandBtn = CreateIconButton(collapsedFrame, "Plus", ExpandMainWindow)
+  RaiseAboveParent(expandBtn, collapsedFrame)
+  expandBtn:SetPoint("TOPRIGHT", collapsedFrame, "TOPRIGHT", -4, -4)
+
+  collapsedStartBtn = AceGUI:Create("Button")
+  collapsedStartBtn:SetWidth(COLLAPSED_BUTTON_WIDTH)
+  collapsedStartBtn:SetHeight(BUTTON_HEIGHT)
+  ns.ShrinkButtonFont(collapsedStartBtn)
+  collapsedStartBtn.frame:SetParent(collapsedFrame)
+  RaiseAboveParent(collapsedStartBtn.frame, collapsedFrame)
+  collapsedStartBtn.frame:ClearAllPoints()
+  collapsedStartBtn.frame:SetPoint("BOTTOMRIGHT", collapsedFrame, "BOTTOMRIGHT", -4, 4)
+  collapsedStartBtn.frame:Show()
+  collapsedStartBtn:SetCallback("OnClick", OnStartStopClick)
+
+  -- Centered directly above collapsedStartBtn, same as countdownLabel sits
+  -- above startBtn in the main window.
+  collapsedCountdownLabel = AceGUI:Create("Label")
+  collapsedCountdownLabel:SetWidth(COLLAPSED_BUTTON_WIDTH)
+  collapsedCountdownLabel.label:SetJustifyH("CENTER")
+  collapsedCountdownLabel.frame:SetParent(collapsedFrame)
+  RaiseAboveParent(collapsedCountdownLabel.frame, collapsedFrame)
+  collapsedCountdownLabel.frame:ClearAllPoints()
+  collapsedCountdownLabel.frame:SetPoint("BOTTOM", collapsedStartBtn.frame, "TOP", 0, 0)
+  collapsedCountdownLabel.frame:Show()
+
+  -- A single TOPLEFT anchor (rather than pinning all 4 sides) sidesteps
+  -- AceGUI Label's own UpdateImageAnchor, which calls frame:SetHeight()
+  -- from the text's single-line height every time :SetText()/:SetWidth()
+  -- runs - anchoring both TOP and BOTTOM would just fight that on every
+  -- refresh. The -3 offset roughly centers a ~14px text line within the
+  -- ~20px middle row.
+  collapsedEngineStatusLabel = AceGUI:Create("Label")
+  collapsedEngineStatusLabel:SetFont(ROW_FONT_FILE, ROW_FONT_HEIGHT, ROW_FONT_FLAGS)
+  collapsedEngineStatusLabel:SetWidth(MAIN_FRAME_WIDTH - COLLAPSED_BUTTON_WIDTH - 24)
+  collapsedEngineStatusLabel.frame:SetParent(collapsedFrame)
+  RaiseAboveParent(collapsedEngineStatusLabel.frame, collapsedFrame)
+  collapsedEngineStatusLabel.frame:ClearAllPoints()
+  collapsedEngineStatusLabel.frame:SetPoint("TOPLEFT", collapsedFrame, "TOPLEFT", 8, -(BUTTON_HEIGHT + 3))
+  collapsedEngineStatusLabel.frame:Show()
+
+  table.insert(engineStatusSinks, collapsedEngineStatusLabel)
+  table.insert(countdownSinks, collapsedCountdownLabel)
+  table.insert(startStopButtons, collapsedStartBtn)
+  RefreshEngineStatus()
+  RefreshCountdown()
+end
+
+-- Same MakeIdiotsAppearDB.windowStatus.main table is reused for both
+-- windows' top/left rather than a second saved-position table - mainFrame
+-- and collapsedFrame are never shown simultaneously by design, so one
+-- shared pair of coordinates is enough to make position sync both ways
+-- (Collapse captures mainFrame's position; Expand captures collapsedFrame's)
+-- fall out naturally.
+function CollapseMainWindow()
+  if not mainFrame then return end
+  EnsureCollapsedFrame()
+
+  local mainStatus = MakeIdiotsAppearDB.windowStatus.main
+  mainStatus.top = mainFrame.frame:GetTop()
+  mainStatus.left = mainFrame.frame:GetLeft()
+
+  HideMainFrameWithoutClosing()
+
+  collapsedFrame:ClearAllPoints()
+  collapsedFrame:SetPoint("TOP", UIParent, "BOTTOM", 0, mainStatus.top)
+  collapsedFrame:SetPoint("LEFT", UIParent, "LEFT", mainStatus.left, 0)
+  collapsedFrame:Show()
+end
+
+function ExpandMainWindow()
+  if not collapsedFrame then return end
+
+  local mainStatus = MakeIdiotsAppearDB.windowStatus.main
+  mainStatus.top = collapsedFrame:GetTop()
+  mainStatus.left = collapsedFrame:GetLeft()
+
+  collapsedFrame:Hide()
+
+  -- Reposition only - not mainFrame:ApplyStatus(), which would also
+  -- re-derive width/height from mainStatus and could fall back to AceGUI's
+  -- own defaults (700x500) if width/height were never actually written into
+  -- SavedVariables (only a drag/resize does that, and resizing is disabled
+  -- on this window). Mirrors ApplyStatus's own position-only logic
+  -- (AceGUIContainer-Frame.lua's ApplyStatus).
+  mainFrame.frame:ClearAllPoints()
+  mainFrame.frame:SetPoint("TOP", UIParent, "BOTTOM", 0, mainStatus.top)
+  mainFrame.frame:SetPoint("LEFT", UIParent, "LEFT", mainStatus.left, 0)
+  mainFrame.frame:Show()
+  RefreshAll()
+end
+
 local function BuildMainFrame()
   local frame = AceGUI:Create("Frame")
   ns.ApplyTooltipWindowStyle(frame)
-  frame:SetTitle("Make Idiots Appear v" .. ns.GetAddonVersion())
+  -- Version suffix dropped from the title to leave room for collapseBtn in
+  -- the top-right corner (see below) - re-add a title repositioning fix
+  -- instead if the shorter title still overlaps it.
+  frame:SetTitle("Make Idiots Appear")
   frame:SetStatusText("")
   frame:SetLayout("Flow")
   frame:EnableResize(false)
@@ -467,7 +695,7 @@ local function BuildMainFrame()
   -- 420 + 20, all of which goes to leftGroup (see its SetRelativeWidth
   -- below) - rightGroup's own relative width was adjusted down at the same
   -- time so its absolute pixel width comes out unchanged.
-  frame:SetWidth(440)
+  frame:SetWidth(MAIN_FRAME_WIDTH)
   -- 500 + 60 for the engine-status panel added below leftGroup/rightGroup
   -- (see STATUS_PANEL_HEIGHT near the bottom of this function) - kept as a
   -- separate hardcoded bump rather than referencing that constant here
@@ -484,6 +712,23 @@ local function BuildMainFrame()
       countdownTicker:Cancel()
       countdownTicker = nil
     end
+    -- Defensive only - collapsing hides mainFrame.frame without firing this
+    -- callback at all (see HideMainFrameWithoutClosing), so collapsedFrame
+    -- shouldn't actually be shown at this point.
+    if collapsedFrame then collapsedFrame:Hide() end
+    -- collapseBtn is a plain native frame parented directly onto frame.frame
+    -- (see below, same reach-past-AceGUI's-layout technique as
+    -- statusBorder), not an AceGUI widget - it's not part of the child
+    -- hierarchy AceGUI:Release(widget) below walks via ReleaseChildren, and
+    -- won't get detached from frame.frame on its own. Since AceGUI recycles
+    -- native frames per widget Type (frame.frame will be handed back out to
+    -- the next "Frame" widget created anywhere in the addon, e.g.
+    -- Settings/Rosters/Groups), leaving collapseBtn parented to it would
+    -- make a stale Collapse button show up on top of whichever window
+    -- recycles this native frame next. Detach it explicitly first.
+    collapseBtn:Hide()
+    collapseBtn:SetParent(UIParent)
+    collapseBtn = nil
     AceGUI:Release(widget)
     mainFrame = nil
   end)
@@ -602,7 +847,6 @@ local function BuildMainFrame()
   -- above for the player rows), so a small blank SimpleGroup between each
   -- button is what creates the visible breathing room.
   local BUTTON_GAP = 4
-  local BUTTON_HEIGHT = 20
   local function CreateButtonSpacer()
     local spacer = AceGUI:Create("SimpleGroup")
     spacer:SetFullWidth(true)
@@ -742,31 +986,12 @@ local function BuildMainFrame()
   startBtn:SetFullWidth(true)
   startBtn:SetHeight(20)
   ns.ShrinkButtonFont(startBtn)
-  startBtn:SetCallback("OnClick", function()
-    if Engine.running or Engine.starting then
-      ns.StopInvites("Stopped by user.")
-      return
-    end
-
-    local activeRoster = MakeIdiotsAppearDB.settings.activeRoster
-    if not activeRoster then
-      print(PREFIX .. "No active roster selected. Use Manage Rosters to create/select one first.")
-      return
-    end
-
-    -- Bench players (past the roster's own group size, see
-    -- ns.GetRosterGroupSize) are deliberately excluded from the automated
-    -- run - they're only invited manually via the "+" button on their own
-    -- bench row.
-    local fullList = MakeIdiotsAppearDB.rosters[activeRoster] or {}
-    local groupSize = ns.GetRosterGroupSize(activeRoster)
-    local list = {}
-    for i = 1, math.min(groupSize, #fullList) do
-      table.insert(list, fullList[i])
-    end
-    ns.StartInvites(list)
-  end)
+  startBtn:SetCallback("OnClick", OnStartStopClick)
   rightGroup:AddChild(startBtn)
+
+  collapseBtn = CreateIconButton(frame.frame, "Minus", CollapseMainWindow)
+  RaiseAboveParent(collapseBtn, frame.frame)
+  collapseBtn:SetPoint("TOPRIGHT", frame.frame, "TOPRIGHT", -4, -4)
 
   ----------------------------------------------------------------
   -- Bottom: engine status
@@ -808,11 +1033,31 @@ local function BuildMainFrame()
   engineStatusLabel:SetText("Idle.")
   statusGroup:AddChild(engineStatusLabel)
 
+  -- Re-seeded (not appended) since BuildMainFrame can run more than once per
+  -- session - ToggleMainFrame/OnClose already tear mainFrame down and
+  -- rebuild it from scratch on every real close/reopen today. collapsedFrame
+  -- itself, once built, survives across mainFrame rebuilds, so its widgets
+  -- are re-added here too if present.
+  engineStatusSinks = { engineStatusLabel }
+  countdownSinks = { countdownLabel }
+  startStopButtons = { startBtn }
+  if collapsedEngineStatusLabel then
+    table.insert(engineStatusSinks, collapsedEngineStatusLabel)
+    table.insert(countdownSinks, collapsedCountdownLabel)
+    table.insert(startStopButtons, collapsedStartBtn)
+  end
+
   return frame
 end
 
 local function ToggleMainFrame()
   ns.EnsureDB()
+
+  if collapsedFrame and collapsedFrame:IsShown() then
+    ExpandMainWindow()
+    return
+  end
+
   if mainFrame then
     if mainFrame.frame:IsShown() then
       mainFrame.frame:Hide()
