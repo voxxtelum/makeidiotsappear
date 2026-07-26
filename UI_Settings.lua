@@ -511,6 +511,20 @@ local function BuildSettingsFrame()
     tabRows[tab.id] = row
   end
 
+  -- Raw FontString (same reasoning as intervalWarningText in BuildInvitesTab
+  -- above - a fixed, non-auto-sizing element) anchored to the bottom of the
+  -- tab list panel, centered horizontally, with a 4px gap to the panel's
+  -- bottom edge.
+  local versionText = tabGroup.content:CreateFontString(nil, "OVERLAY", "ChatFontNormal")
+  versionText:SetPoint("BOTTOM", tabGroup.content, "BOTTOM", 0, 4)
+  versionText:SetJustifyH("CENTER")
+  versionText:SetTextColor(1, 0.82, 0)
+  do
+    local fontPath, fontHeight, fontFlags = versionText:GetFont()
+    versionText:SetFont(fontPath, fontHeight - 2, fontFlags)
+  end
+  versionText:SetText("v" .. ns.GetAddonVersion())
+
   SelectTab(selectedTabId)
 
   -- Lets ns.ShowSettingsFrame's already-open branch reset the currently
