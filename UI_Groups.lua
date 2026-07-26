@@ -23,7 +23,7 @@ local SLOT_WIDTH = 145
 -- The 40 editable group slots only (see CreateEditableSlot) - kept separate
 -- from SLOT_WIDTH, which the read-only unassigned-pool tokens (see
 -- CreateTokenFrame) still use, so widening one doesn't also widen the other.
-local EDITABLE_SLOT_WIDTH = SLOT_WIDTH + 10
+local EDITABLE_SLOT_WIDTH = SLOT_WIDTH + 15
 local SLOT_HEIGHT = 20            -- includes 3px of vertical padding top and bottom around the centered (now 1px larger) text
 local SLOT_GAP = 2
 local GROUP_TITLE_TOP_PADDING = 6 -- clearance above the "Group N" label, below the box's top edge
@@ -33,6 +33,7 @@ local GROUP_BOX_WIDTH = EDITABLE_SLOT_WIDTH + GROUP_BOX_PADDING * 2
 local GROUP_BOX_HEIGHT = GROUP_TITLE_HEIGHT + SLOTS_PER_GROUP * (SLOT_HEIGHT + SLOT_GAP) + GROUP_BOX_PADDING
 local GROUP_BOX_GAP_X = 10
 local GROUP_BOX_GAP_Y = 4 -- smaller than GROUP_BOX_GAP_X since the taller slots already add vertical space between rows
+local GROUP_GRID_LEFT_PADDING = 8 -- clearance between leftGroup's own left edge and the first column of group boxes
 
 -- 2pt smaller than ns.GetChatFont's own default - same treatment as player
 -- names in UI_Main.lua and roster names in UI_Rosters.lua.
@@ -310,6 +311,44 @@ local function UpdateBenchMarker(f, name, benchSet)
   end
 end
 
+-- Small gold crown pinned to the left edge, shown only for whichever slot/
+-- token currently holds the raid leader (see ns.FindRaidLeader) - the same
+-- crown Blizzard's own raid frame shows, mirrored here so leadership stays
+-- recognizable once someone's dragged into/out of a group slot. Same
+-- fixed-position, no-text-resizing treatment as AddBenchMarker's "B" above
+-- (only one row at a time ever shows it, so an occasional pixel of overlap
+-- with a short name is an acceptable tradeoff). Drawn on an explicit high
+-- OVERLAY sublevel so it always renders above the name text/EditBox font
+-- regardless of which was created first.
+local LEADER_ICON_SIZE = 12
+
+local function AddLeaderIcon(f)
+  local icon = f:CreateTexture(nil, "OVERLAY", nil, 7)
+  icon:SetTexture("Interface\\GroupFrame\\UI-Group-LeaderIcon")
+  icon:SetSize(LEADER_ICON_SIZE, LEADER_ICON_SIZE)
+  -- Centered on the row's left edge (vertically centered, half spilling
+  -- outside to the left) rather than the top-left corner - see if this reads
+  -- better than the corner placement.
+  icon:SetPoint("CENTER", f, "LEFT", -8, 0)
+  icon:Hide()
+  f.leaderIcon = icon
+  return icon
+end
+
+-- rlFullName is whatever ns.FindRaidLeader() returned this refresh (nil if no
+-- raid or no leader) - matched the same tolerant way missing-indicator/bench
+-- lookups already are elsewhere in this file, since a slot's stored name and
+-- the unit-derived leader name might differ in whether a realm is attached.
+local function UpdateLeaderIcon(f, name, rlFullName)
+  local isLeader = name and rlFullName and
+      (name:lower() == rlFullName:lower() or ns.NamePart(name) == ns.NamePart(rlFullName))
+  if isLeader then
+    f.leaderIcon:Show()
+  else
+    f.leaderIcon:Hide()
+  end
+end
+
 -- Read-only, drag-source-only token used for the unassigned pool - matches
 -- MRT's "not in list" column, which is also just a drag source, never
 -- directly editable (only the main 40 group slots are, see
@@ -326,6 +365,7 @@ local function CreateTokenFrame(parent)
 
   AddMissingIndicator(f)
   AddBenchMarker(f)
+  AddLeaderIcon(f)
 
   -- ChatFontNormal is Blizzard's own default chat text font (Fonts\ARIALN.TTF,
   -- i.e. Arial Narrow) - used here instead of GameFontHighlightSmall so
@@ -462,6 +502,7 @@ local function CreateEditableSlot(parent)
 
   AddMissingIndicator(f)
   AddBenchMarker(f)
+  AddLeaderIcon(f)
 
   SetupDrag(f)
 
@@ -514,13 +555,14 @@ local function ResetSlotHome(slot)
   slot:SetFrameStrata(RESTING_STRATA)
 end
 
-local function SetTokenDisplay(frame, name, classMap, groupSet, benchSet)
+local function SetTokenDisplay(frame, name, classMap, groupSet, benchSet, rlFullName)
   frame.text:SetText(name or "")
   if name then
     frame.text:SetTextColor(ComputeNameColor(name, classMap))
   end
   UpdateMissingIndicator(frame, name, groupSet)
   UpdateBenchMarker(frame, name, benchSet)
+  UpdateLeaderIcon(frame, name, rlFullName)
 end
 
 -- Same idea as SetTokenDisplay, but for the editable EditBox-based group
@@ -530,7 +572,7 @@ end
 -- Color is applied via GetColoredFont/SetFontObject rather than
 -- SetTextColor - see the comment above CreateEditableSlot's font cache for
 -- why.
-local function SetSlotEditBoxDisplay(slot, name, classMap, groupSet, benchSet)
+local function SetSlotEditBoxDisplay(slot, name, classMap, groupSet, benchSet, rlFullName)
   if slot:HasFocus() then
     return
   end
@@ -543,6 +585,7 @@ local function SetSlotEditBoxDisplay(slot, name, classMap, groupSet, benchSet)
   end
   UpdateMissingIndicator(slot, name, groupSet)
   UpdateBenchMarker(slot, name, benchSet)
+  UpdateLeaderIcon(slot, name, rlFullName)
 end
 
 local function CreateGroupBox(parent, groupIndex, x, y)
@@ -758,6 +801,7 @@ local function DoRefreshGroupsWindow()
   local comp, data = GetComp()
   local classMap = ns.GetClassMap()
   local groupSet = ns.GetGroupNameSet()
+  local rlFullName = ns.FindRaidLeader()
 
   -- Bench = roster entries past the roster's own group size (see
   -- ns.GetRosterGroupSize) - same split UI_Main.lua's player list uses,
@@ -778,7 +822,7 @@ local function DoRefreshGroupsWindow()
     for p = 1, SLOTS_PER_GROUP do
       local slot = slotFrames[g][p]
       ResetSlotHome(slot)
-      SetSlotEditBoxDisplay(slot, list[p], classMap, groupSet, benchSet)
+      SetSlotEditBoxDisplay(slot, list[p], classMap, groupSet, benchSet, rlFullName)
     end
   end
 
@@ -800,7 +844,7 @@ local function DoRefreshGroupsWindow()
     local token = AcquireUnassignedToken(i)
     token:SetWidth(tokenWidth)
     token.playerName = name
-    SetTokenDisplay(token, name, classMap, groupSet, benchSet)
+    SetTokenDisplay(token, name, classMap, groupSet, benchSet, rlFullName)
     token:ClearAllPoints()
     token:SetPoint("TOPLEFT", unassignedContent, "TOPLEFT", 0, -(i - 1) * (SLOT_HEIGHT + SLOT_GAP))
     token:Show()
@@ -900,13 +944,16 @@ local function BuildGroupsFrame()
   -- remember window position across sessions.
   MakeIdiotsAppearDB.windowStatus.groups = MakeIdiotsAppearDB.windowStatus.groups or {}
   f:SetStatusTable(MakeIdiotsAppearDB.windowStatus.groups)
-  -- 15px wider than the original 800 - all of it goes to unassignedGroup below,
-  -- which needed the extra room once it got its own real scrollbar (see
+  -- 40px wider than the original 800: 15px went to unassignedGroup, which
+  -- needed the extra room once it got its own real scrollbar (see
   -- unassignedScrollFrame) - the bar's track sits inset from the
   -- scrollframe's own right edge rather than fully outside it, and the
   -- original width left too little clearance between that and a token's
-  -- rightmost content (namely the bench "B" marker).
-  f:SetWidth(815)
+  -- rightmost content (namely the bench "B" marker). The remaining 25px all
+  -- goes to leftGroup below - unassignedGroup/rightGroup's own relative
+  -- widths are shrunk just enough to keep their ABSOLUTE pixel width
+  -- unchanged as the window grew (see leftGroup's own comment for the math).
+  f:SetWidth(840)
   f:SetHeight(680)
 
   -- Deliberately never AceGUI:Release()'d, unlike the addon's other windows:
@@ -933,13 +980,22 @@ local function BuildGroupsFrame()
   -- Left blank ("List" default, never given any AceGUI children - the group
   -- grid below is raw frames parented straight to leftGroup.content).
   -- Deliberately left a hair under 1.0 when summed with unassignedGroup/
-  -- rightGroup below (0.45 + 0.245 + 0.275 = 0.97) - see UI_Rosters.lua's
+  -- rightGroup below (0.4861 + 0.2374 + 0.2665 = 0.99) - see UI_Rosters.lua's
   -- leftGroup for why: AceGUI's "Flow" layout (used by this window's outer
   -- frame) can wrap a child to a new row if pixel-rounding pushes the
-  -- combined width a fraction over the container's. Kept at roughly its
-  -- original absolute pixel width even though the window itself grew 15px
-  -- (see f:SetWidth above) - only unassignedGroup was meant to gain that room.
-  leftGroup:SetRelativeWidth(0.45)
+  -- combined width a fraction over the container's. That buffer is only 1%
+  -- now (was 3%, when this summed to 0.97) - tightened since a hair under 1.0
+  -- has been enough margin in practice.
+  --
+  -- AceGUI's Frame content area is inset 17px from each side (see
+  -- AceGUIContainer-Frame.lua's content:SetPoint calls), so content width is
+  -- window width minus 34: 781px at the old 815px window, 806px now at 840px.
+  -- unassignedGroup/rightGroup's fractions below were both recalculated as
+  -- (old fraction * 781 / 806) to keep their ABSOLUTE pixel width exactly
+  -- what it was before the window grew - every pixel of the extra room (25px
+  -- of window width, ~24px of content width) goes to leftGroup here instead,
+  -- pushing its own fraction up from 0.45 accordingly.
+  leftGroup:SetRelativeWidth(0.4861)
   leftGroup.noAutoHeight = true
   leftGroup:SetHeight(PANEL_HEIGHT)
   f:AddChild(leftGroup)
@@ -948,7 +1004,7 @@ local function BuildGroupsFrame()
   for g = 1, GROUPS_PER_COMP do
     local col = (g - 1) % 2
     local row = math.floor((g - 1) / 2)
-    local x = col * (GROUP_BOX_WIDTH + GROUP_BOX_GAP_X)
+    local x = GROUP_GRID_LEFT_PADDING + col * (GROUP_BOX_WIDTH + GROUP_BOX_GAP_X)
     local y = -(row * (GROUP_BOX_HEIGHT + GROUP_BOX_GAP_Y))
     CreateGroupBox(leftGroup.content, g, x, y)
   end
@@ -960,9 +1016,10 @@ local function BuildGroupsFrame()
   unassignedGroup = AceGUI:Create("InlineGroup")
   unassignedGroup:SetTitle("Unassigned")
   -- Same as leftGroup above - no AceGUI children, tokens are raw frames.
-  -- ~15px wider (in absolute terms) than before the window itself grew to
-  -- make room for it - see leftGroup's own comment and f:SetWidth above.
-  unassignedGroup:SetRelativeWidth(0.245)
+  -- Absolute pixel width unchanged from before the window grew to 840 - see
+  -- leftGroup's own comment for the fraction recalculation this and
+  -- rightGroup below both got.
+  unassignedGroup:SetRelativeWidth(0.2374)
   unassignedGroup.noAutoHeight = true
   unassignedGroup:SetHeight(PANEL_HEIGHT)
   f:AddChild(unassignedGroup)
@@ -1023,9 +1080,9 @@ local function BuildGroupsFrame()
   local rightGroup = AceGUI:Create("InlineGroup")
   rightGroup:SetTitle("Compositions")
   rightGroup:SetLayout("List")
-  -- See leftGroup's own comment above - kept at roughly its original
-  -- absolute pixel width, same as leftGroup.
-  rightGroup:SetRelativeWidth(0.275)
+  -- See leftGroup's own comment above - absolute pixel width unchanged from
+  -- before the window grew to 840, same as unassignedGroup.
+  rightGroup:SetRelativeWidth(0.2665)
   rightGroup.noAutoHeight = true
   rightGroup:SetHeight(PANEL_HEIGHT)
   f:AddChild(rightGroup)

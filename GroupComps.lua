@@ -289,6 +289,7 @@ local function FindRaidLeader()
   end
   return nil
 end
+ns.FindRaidLeader = FindRaidLeader
 
 -- Snapshot of who's actually in the raid right now, keyed by lowercased full
 -- name: which subgroup they're in, and their position within it (assigned by
