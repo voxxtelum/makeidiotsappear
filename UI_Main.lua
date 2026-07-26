@@ -27,12 +27,17 @@ local ROW_FONT_FILE, ROW_FONT_HEIGHT, ROW_FONT_FLAGS = ns.GetChatFont(-2)
 -- scratch FontString rather than read back from a row's own (recycled)
 -- Label widget.
 local ROW_VERTICAL_PADDING = 2
+-- Raw single-line height for ROW_FONT_FILE/HEIGHT/FLAGS, measured once via a
+-- disposable scratch FontString - also used by the engine status grid below
+-- to center its two text rows vertically without guessing at font metrics.
+local ROW_TEXT_LINE_HEIGHT
 local ROW_LABEL_HEIGHT
 do
   local scratch = UIParent:CreateFontString(nil, "BACKGROUND")
   scratch:SetFont(ROW_FONT_FILE, ROW_FONT_HEIGHT, ROW_FONT_FLAGS)
   scratch:SetText("Sample")
-  ROW_LABEL_HEIGHT = scratch:GetHeight() + ROW_VERTICAL_PADDING * 2
+  ROW_TEXT_LINE_HEIGHT = scratch:GetHeight()
+  ROW_LABEL_HEIGHT = ROW_TEXT_LINE_HEIGHT + ROW_VERTICAL_PADDING * 2
 end
 
 -- While invites are active, the roster half of the list (not the "extras"
@@ -50,7 +55,7 @@ local ACTIVE_STATUS_SORT_RANK = {
 }
 
 local mainFrame = nil
-local leftGroup, playerScroll, engineStatusLabel, countdownLabel, startBtn
+local leftGroup, playerScroll, engineStatusGrid, startBtn
 local lootThresholdBtn, lootThresholdDropdown, disbandBtn
 local benchLabel, benchScroll
 
@@ -66,7 +71,7 @@ local benchLabel, benchScroll
 -- button pixel-for-pixel.
 local collapsedFrame = nil
 local collapseBtn, expandBtn, collapsedStartBtn
-local collapsedEngineStatusLabel, collapsedCountdownLabel
+local collapsedEngineStatusGrid
 local COLLAPSED_BUTTON_WIDTH = 100
 local BUTTON_HEIGHT = 20
 local ICON_BUTTON_SIZE = 16
@@ -77,7 +82,6 @@ local MAIN_FRAME_WIDTH = 440
 -- current text, without either function needing to know which one is
 -- visible right now.
 local engineStatusSinks = {}
-local countdownSinks = {}
 local startStopButtons = {}
 
 -- Widgets created via AceGUI:Create and then reparented directly onto a
@@ -114,6 +118,113 @@ local function CreateIconButton(parent, iconName, onClick)
   btn:SetHighlightTexture("Interface\\Buttons\\UI-" .. iconName .. "Button-UP", "ADD")
   btn:SetScript("OnClick", onClick)
   return btn
+end
+
+----------------------------------------------------------------------
+-- Engine status 3x2 grid (shared by both the main and collapsed windows)
+----------------------------------------------------------------------
+
+-- Same green as STATUS_COLORS["Online"] above - "Running"/"Starting..." read
+-- as the same kind of healthy/active state as an online player's status text.
+local ENGINE_ACTIVE_COLOR = { 0.2, 1, 0.2 }
+-- Same gold used throughout the addon for this kind of label/highlight text
+-- (see e.g. MakeIdiotsAppear.lua's gold highlight, UI_Rosters.lua's checkbox
+-- text) - also used for "Idle" itself.
+local ENGINE_GOLD_COLOR = { 1, 0.82, 0 }
+local ENGINE_VALUE_COLOR = { 1, 1, 1 }
+
+local function ColorizeText(text, color)
+  return string.format("|cff%02x%02x%02x%s|r", color[1] * 255, color[2] * 255, color[3] * 255, text)
+end
+
+-- Row height for the grid below - sized to the toggle button's own height
+-- (rather than the shorter text-only height used before column 3 existed)
+-- so the button drops into column 3 at its normal size instead of shrinking
+-- to fit a text-sized row. Text cells are then vertically centered within
+-- this taller band (see CreateCell's offset math below) instead of sitting
+-- flush against the row's top like they did before.
+local ENGINE_GRID_ROW_HEIGHT = BUTTON_HEIGHT
+
+-- Builds the engine status readout: "Idle"/"Running"/"Starting..." plus the
+-- pending/queued/skipped counts in columns 1-2, and the countdown text +
+-- toggle button in column 3 - 3 columns x 2 rows. Text cells are raw,
+-- independently-anchored FontStrings rather than an AceGUI layout, so a
+-- value's length changing (e.g. the queue count going from "20" to "5")
+-- never shifts any of the other cells - same raw-anchor technique as
+-- UI_Settings.lua's prefixDelayRow, for the same reason. Plain text directly
+-- on `parent`, no borders/background of its own. x/y anchors cell (1,1) from
+-- parent's TOPLEFT; colGap is the offset from one column to the next (the
+-- same value is used for both column 1->2 and 2->3, kept identical between
+-- this window and the collapsed bar so the two match). `button` is the
+-- caller's already-created Start/Stop AceGUI Button widget - reparented and
+-- resized into column 3's second row here so both callers end up with the
+-- exact same button size instead of each re-deriving it.
+local function CreateEngineStatusGrid(parent, x, y, colGap, button)
+  local function CreateCell(cellX, cellY)
+    local fs = parent:CreateFontString(nil, "OVERLAY")
+    fs:SetFont(ROW_FONT_FILE, ROW_FONT_HEIGHT, ROW_FONT_FLAGS)
+    fs:SetJustifyH("LEFT")
+    -- Nudged down so a single line of text centers within the row's full
+    -- ENGINE_GRID_ROW_HEIGHT band instead of hugging its top edge.
+    fs:SetPoint("TOPLEFT", parent, "TOPLEFT", cellX, cellY - (ENGINE_GRID_ROW_HEIGHT - ROW_TEXT_LINE_HEIGHT) / 2)
+    return fs
+  end
+
+  local row1Y, row2Y = y, y - ENGINE_GRID_ROW_HEIGHT
+  local col1X, col2X, col3X = x, x + colGap, x + colGap * 2
+
+  -- Countdown text sits in column 1 (left-justified, like the other text
+  -- cells) - "Idle"/"Running"/"Starting..." sits in column 3 instead (see
+  -- stateCell below), swapped from column 1 so it reads as centered directly
+  -- over the toggle button beneath it.
+  local countdownCell = CreateCell(col1X, row1Y)
+  local cell12 = CreateCell(col2X, row1Y)
+  local cell21 = CreateCell(col1X, row2Y)
+  local cell22 = CreateCell(col2X, row2Y)
+
+  -- Unlike the other cells, this one is centered over the same width as the
+  -- toggle button below it (rather than left-justified) so it reads as
+  -- sitting directly above the button, not just left-aligned in column 3.
+  local stateCell = CreateCell(col3X, row1Y)
+  stateCell:SetWidth(COLLAPSED_BUTTON_WIDTH)
+  stateCell:SetJustifyH("CENTER")
+
+  -- Fills its row exactly (ENGINE_GRID_ROW_HEIGHT == BUTTON_HEIGHT), so
+  -- unlike the text cells above it needs no vertical-centering offset of its
+  -- own.
+  button.frame:SetParent(parent)
+  RaiseAboveParent(button.frame, parent)
+  button.frame:ClearAllPoints()
+  button:SetWidth(COLLAPSED_BUTTON_WIDTH)
+  button:SetHeight(ENGINE_GRID_ROW_HEIGHT)
+  button.frame:SetPoint("TOPLEFT", parent, "TOPLEFT", col3X, row2Y)
+  button.frame:Show()
+
+  local grid = {}
+
+  -- mode is "idle" | "starting" | "running"; values (only used when
+  -- "running") is { pending, queued, skipped }.
+  function grid:SetState(mode, values)
+    if mode == "running" then
+      stateCell:SetText(ColorizeText("Running", ENGINE_ACTIVE_COLOR))
+      cell12:SetText(ColorizeText("Pending Invites: " .. tostring(values.pending), ENGINE_VALUE_COLOR))
+      cell21:SetText(ColorizeText("Next Pass Queue: " .. tostring(values.queued), ENGINE_VALUE_COLOR))
+      cell22:SetText(ColorizeText("Whispered/Skipped: " .. tostring(values.skipped), ENGINE_VALUE_COLOR))
+    else
+      stateCell:SetText(ColorizeText(mode == "starting" and "Starting..." or "Idle",
+        mode == "starting" and ENGINE_ACTIVE_COLOR or ENGINE_GOLD_COLOR))
+      cell12:SetText("")
+      cell21:SetText("")
+      cell22:SetText("")
+    end
+  end
+
+  -- text is "" when there's no active countdown.
+  function grid:SetCountdown(text)
+    countdownCell:SetText(text)
+  end
+
+  return grid
 end
 
 local ROW_GAP = 2
@@ -438,37 +549,36 @@ local function RefreshPlayerList()
   benchScroll:SetScroll(savedBenchScroll)
 end
 
--- Updates every sink in engineStatusSinks/startStopButtons/countdownSinks
--- (both mainFrame's and, once built, collapsedFrame's widgets) rather than a
--- single hardcoded widget - so whichever window is showing (or about to be
--- shown via Expand/Collapse) always already has current text, with no
--- "which window is visible" branching needed here.
+-- Updates every sink in engineStatusSinks/startStopButtons (both mainFrame's
+-- and, once built, collapsedFrame's widgets) rather than a single hardcoded
+-- widget - so whichever window is showing (or about to be shown via
+-- Expand/Collapse) always already has current text, with no "which window is
+-- visible" branching needed here.
 local function RefreshEngineStatus()
-  local statusText, buttonText
+  local mode, values, buttonText
   if Engine.starting then
-    statusText = "Starting invites shortly..."
+    mode = "starting"
     buttonText = "Stop Invites"
   elseif Engine.running then
-    statusText = string.format(
-      "Running. Pending invites: %d | Queued for next pass: %d | Whispered/skipped: %d",
-      ns.CountPendingInvites(), #Engine.queue, #Engine.skipped)
+    mode = "running"
+    values = {
+      pending = ns.CountPendingInvites(),
+      queued = #Engine.queue,
+      skipped = #Engine.skipped,
+    }
     buttonText = "Stop Invites"
   else
-    local skippedNote = ""
-    if #Engine.skipped > 0 then
-      skippedNote = " | Needs follow-up: " .. table.concat(Engine.skipped, ", ")
-    end
-    statusText = "Idle." .. skippedNote
+    mode = "idle"
     buttonText = "Start Invites"
   end
-  for _, label in ipairs(engineStatusSinks) do label:SetText(statusText) end
+  for _, grid in ipairs(engineStatusSinks) do grid:SetState(mode, values) end
   for _, btn in ipairs(startStopButtons) do btn:SetText(buttonText) end
 end
 
 local function RefreshCountdown()
   local seconds = ns.GetSecondsUntilNextPass()
   local text = seconds and string.format("Next invites: %ds", seconds) or ""
-  for _, label in ipairs(countdownSinks) do label:SetText(text) end
+  for _, grid in ipairs(engineStatusSinks) do grid:SetCountdown(text) end
 end
 
 -- Only :Show()/:Hide()s the button/dropdown/disband button rather than
@@ -583,50 +693,22 @@ function EnsureCollapsedFrame()
   RaiseAboveParent(expandBtn, collapsedFrame)
   expandBtn:SetPoint("TOPRIGHT", collapsedFrame, "TOPRIGHT", -4, -4)
 
+  -- Sizing/positioning (including fitting it into column 3's row) is handled
+  -- by CreateEngineStatusGrid below, same as the main window's startBtn.
   collapsedStartBtn = AceGUI:Create("Button")
-  collapsedStartBtn:SetWidth(COLLAPSED_BUTTON_WIDTH)
-  collapsedStartBtn:SetHeight(BUTTON_HEIGHT)
   ns.ShrinkButtonFont(collapsedStartBtn)
-  collapsedStartBtn.frame:SetParent(collapsedFrame)
-  RaiseAboveParent(collapsedStartBtn.frame, collapsedFrame)
-  collapsedStartBtn.frame:ClearAllPoints()
-  -- Right edge sits 4px left of expandBtn's own left edge (expandBtn is
-  -- ICON_BUTTON_SIZE wide, anchored 4px in from collapsedFrame's right edge -
-  -- ICON_BUTTON_SIZE + 4 (expandBtn's margin) + 4 (this button's own margin)
-  -- clears it). Top edge sits at the box's vertical midpoint.
-  collapsedStartBtn.frame:SetPoint("TOPRIGHT", collapsedFrame, "TOPRIGHT",
-    -(ICON_BUTTON_SIZE + 8), -(BUTTON_HEIGHT * 3 / 2))
-  collapsedStartBtn.frame:Show()
   collapsedStartBtn:SetCallback("OnClick", OnStartStopClick)
 
-  -- Centered directly above collapsedStartBtn, same as countdownLabel sits
-  -- above startBtn in the main window.
-  collapsedCountdownLabel = AceGUI:Create("Label")
-  collapsedCountdownLabel:SetWidth(COLLAPSED_BUTTON_WIDTH)
-  collapsedCountdownLabel.label:SetJustifyH("CENTER")
-  collapsedCountdownLabel.frame:SetParent(collapsedFrame)
-  RaiseAboveParent(collapsedCountdownLabel.frame, collapsedFrame)
-  collapsedCountdownLabel.frame:ClearAllPoints()
-  collapsedCountdownLabel.frame:SetPoint("BOTTOM", collapsedStartBtn.frame, "TOP", 0, 4)
-  collapsedCountdownLabel.frame:Show()
+  -- Raw FontStrings created directly on collapsedFrame (see
+  -- CreateEngineStatusGrid's own comment). y is picked so the grid's full
+  -- 2-row height sits centered within collapsedFrame's total height, leaving
+  -- equal space above row 1 and below row 2. 140 is the same column gap the
+  -- main window uses below, so the two look consistent.
+  local engineGridBlockHeight = ENGINE_GRID_ROW_HEIGHT * 2
+  local engineGridTopMargin = (collapsedFrame:GetHeight() - engineGridBlockHeight) / 2
+  collapsedEngineStatusGrid = CreateEngineStatusGrid(collapsedFrame, 16, -engineGridTopMargin, 140, collapsedStartBtn)
 
-  -- A single TOPLEFT anchor (rather than pinning all 4 sides) sidesteps
-  -- AceGUI Label's own UpdateImageAnchor, which calls frame:SetHeight()
-  -- from the text's single-line height every time :SetText()/:SetWidth()
-  -- runs - anchoring both TOP and BOTTOM would just fight that on every
-  -- refresh. The -3 offset roughly centers a ~14px text line within the
-  -- ~20px middle row.
-  collapsedEngineStatusLabel = AceGUI:Create("Label")
-  collapsedEngineStatusLabel:SetFont(ROW_FONT_FILE, ROW_FONT_HEIGHT, ROW_FONT_FLAGS)
-  collapsedEngineStatusLabel:SetWidth(MAIN_FRAME_WIDTH - COLLAPSED_BUTTON_WIDTH - 24)
-  collapsedEngineStatusLabel.frame:SetParent(collapsedFrame)
-  RaiseAboveParent(collapsedEngineStatusLabel.frame, collapsedFrame)
-  collapsedEngineStatusLabel.frame:ClearAllPoints()
-  collapsedEngineStatusLabel.frame:SetPoint("TOPLEFT", collapsedFrame, "TOPLEFT", 8, -(BUTTON_HEIGHT + 3))
-  collapsedEngineStatusLabel.frame:Show()
-
-  table.insert(engineStatusSinks, collapsedEngineStatusLabel)
-  table.insert(countdownSinks, collapsedCountdownLabel)
+  table.insert(engineStatusSinks, collapsedEngineStatusGrid)
   table.insert(startStopButtons, collapsedStartBtn)
   RefreshEngineStatus()
   RefreshCountdown()
@@ -730,6 +812,13 @@ local function BuildMainFrame()
     -- callback at all (see HideMainFrameWithoutClosing), so collapsedFrame
     -- shouldn't actually be shown at this point.
     if collapsedFrame then collapsedFrame:Hide() end
+    -- startBtn is an AceGUI widget, but reparented directly onto
+    -- statusGroup.content (see CreateEngineStatusGrid) rather than added via
+    -- rightGroup:AddChild - it isn't part of the child hierarchy
+    -- AceGUI:Release(widget) below walks via ReleaseChildren, and would leak
+    -- a new orphaned Button widget on every mainFrame rebuild otherwise.
+    -- Release it explicitly first so it goes back to AceGUI's Button pool.
+    AceGUI:Release(startBtn)
     -- collapseBtn is a plain native frame parented directly onto frame.frame
     -- (see below, same reach-past-AceGUI's-layout technique as
     -- statusBorder), not an AceGUI widget - it's not part of the child
@@ -907,11 +996,9 @@ local function BuildMainFrame()
   -- the raid leader, so RefreshLootThresholdControls (called from
   -- RefreshAll) hides/shows them as group/leader status changes. They stay
   -- in rightGroup's "List" stack at all times (just invisible when hidden)
-  -- so Start/Stop and everything else below never shifts - see
-  -- RefreshLootThresholdControls's own comment for why Hide()/Show() is
-  -- enough here rather than AddChild/ReleaseChildren.
-  local LOOT_THRESHOLD_DROPDOWN_HEIGHT = 26 -- AceGUI Dropdown's own unlabeled height, see AceGUIWidget-Dropdown.lua's SetLabel
-
+  -- so disbandBtn below never shifts - see RefreshLootThresholdControls's own
+  -- comment for why Hide()/Show() is enough here rather than
+  -- AddChild/ReleaseChildren.
   local lootThresholdSpacer = AceGUI:Create("SimpleGroup")
   lootThresholdSpacer:SetFullWidth(true)
   lootThresholdSpacer.noAutoHeight = true
@@ -960,48 +1047,14 @@ local function BuildMainFrame()
   end)
   rightGroup:AddChild(disbandBtn)
 
-  -- "List" layout just stacks children top-down with no auto-fill, so a
-  -- blank spacer is what pushes Start/Stop down to the bottom of the panel.
-  -- (A Label won't hold a forced height - it recalculates itself from its
-  -- text on every SetText/SetWidth. SimpleGroup respects noAutoHeight.) The
-  -- spacer is shortened by the two button gaps above, the loot threshold
-  -- block above, disbandSpacer+disbandBtn, and the countdown container
-  -- reserved below, so Start/Stop lands in the same spot regardless of any
-  -- of those being hidden/shown.
-  local COUNTDOWN_HEIGHT = 14
-  local spacer = AceGUI:Create("SimpleGroup")
-  spacer:SetFullWidth(true)
-  spacer.noAutoHeight = true
-  spacer:SetHeight(300 - (2 * BUTTON_GAP) - COUNTDOWN_HEIGHT
-    - BUTTON_HEIGHT - BUTTON_HEIGHT - LOOT_THRESHOLD_DROPDOWN_HEIGHT - BUTTON_HEIGHT - BUTTON_HEIGHT)
-  rightGroup:AddChild(spacer)
-
-  -- Label always left-justifies its text with no built-in way to change
-  -- that, so reach into its FontString directly to center this one. The
-  -- Label itself recalculates its height from its text (empty vs. "Next
-  -- invites: Xs"), which used to shift Start/Stop down when a countdown
-  -- appeared - wrapping it in a fixed-height, noAutoHeight SimpleGroup
-  -- reserves that space permanently so nothing below it ever moves.
-  local countdownContainer = AceGUI:Create("SimpleGroup")
-  countdownContainer:SetFullWidth(true)
-  countdownContainer.noAutoHeight = true
-  countdownContainer:SetHeight(COUNTDOWN_HEIGHT)
-  countdownContainer:SetLayout("Fill")
-
-  countdownLabel = AceGUI:Create("Label")
-  countdownLabel:SetFullWidth(true)
-  countdownLabel:SetText("")
-  countdownLabel.label:SetJustifyH("CENTER")
-  countdownContainer:AddChild(countdownLabel)
-  rightGroup:AddChild(countdownContainer)
-
+  -- Start/Stop itself no longer lives in rightGroup - it and the countdown
+  -- text now sit in column 3 of the engine status grid below (see
+  -- CreateEngineStatusGrid), so both windows show them in the same place.
+  -- Sizing/positioning is handled there too.
   startBtn = AceGUI:Create("Button")
   startBtn:SetText("Start Invites")
-  startBtn:SetFullWidth(true)
-  startBtn:SetHeight(20)
   ns.ShrinkButtonFont(startBtn)
   startBtn:SetCallback("OnClick", OnStartStopClick)
-  rightGroup:AddChild(startBtn)
 
   collapseBtn = CreateIconButton(frame.frame, "Minus", CollapseMainWindow)
   RaiseAboveParent(collapseBtn, frame.frame)
@@ -1039,25 +1092,38 @@ local function BuildMainFrame()
   statusBorder:SetPoint("TOPLEFT", 0, -3)
   statusBorder:SetPoint("BOTTOMRIGHT", -1, 3)
 
-  -- Same font as the player name/status columns to the left (see
-  -- ROW_FONT_FILE/HEIGHT/FLAGS at the top of this file).
-  engineStatusLabel = AceGUI:Create("Label")
-  engineStatusLabel:SetFullWidth(true)
-  engineStatusLabel:SetFont(ROW_FONT_FILE, ROW_FONT_HEIGHT, ROW_FONT_FLAGS)
-  engineStatusLabel:SetText("Idle.")
-  statusGroup:AddChild(engineStatusLabel)
+  -- InlineGroup's content is also inset a fixed 10px from its border on
+  -- every side by default (see the same Constructor) - within a
+  -- STATUS_PANEL_HEIGHT this short, that left only ~34px of the panel's 60px
+  -- for the engine status grid to work with, not the 2*ENGINE_GRID_ROW_HEIGHT
+  -- (40px) it actually needs, so the Start/Stop button hung off the bottom
+  -- of the panel. Flatten it to match statusBorder's own trim above so
+  -- content fills the border completely instead.
+  statusGroup.content:ClearAllPoints()
+  statusGroup.content:SetPoint("TOPLEFT", 0, 0)
+  statusGroup.content:SetPoint("BOTTOMRIGHT", 0, 0)
+
+  -- Raw FontStrings created directly on statusGroup.content, not AddChild'd
+  -- through AceGUI (see CreateEngineStatusGrid's own comment) - keeps the
+  -- grid's cell positions fixed regardless of statusGroup's own List layout.
+  -- startBtn is handed in here rather than added to rightGroup - see its own
+  -- creation comment above. x/y aren't 0,0 despite content now being flush
+  -- with border's own frame edges above - PaneBackdrop's insets (see
+  -- AceGUIContainer-InlineGroup.lua's Constructor) draw the visible border
+  -- line 3px in from the left/right and 5px in from the top of that frame,
+  -- so a 0,0 margin rendered text outside the visible box on those two
+  -- sides. 4/-6 clears both with a little room to spare.
+  engineStatusGrid = CreateEngineStatusGrid(statusGroup.content, 8, -6, 140, startBtn)
 
   -- Re-seeded (not appended) since BuildMainFrame can run more than once per
   -- session - ToggleMainFrame/OnClose already tear mainFrame down and
   -- rebuild it from scratch on every real close/reopen today. collapsedFrame
   -- itself, once built, survives across mainFrame rebuilds, so its widgets
   -- are re-added here too if present.
-  engineStatusSinks = { engineStatusLabel }
-  countdownSinks = { countdownLabel }
+  engineStatusSinks = { engineStatusGrid }
   startStopButtons = { startBtn }
-  if collapsedEngineStatusLabel then
-    table.insert(engineStatusSinks, collapsedEngineStatusLabel)
-    table.insert(countdownSinks, collapsedCountdownLabel)
+  if collapsedEngineStatusGrid then
+    table.insert(engineStatusSinks, collapsedEngineStatusGrid)
     table.insert(startStopButtons, collapsedStartBtn)
   end
 
