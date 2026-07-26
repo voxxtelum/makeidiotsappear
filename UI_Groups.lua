@@ -75,6 +75,8 @@ local currentRosterName = nil
 local slotFrames = {}    -- slotFrames[groupIndex][posIndex] = frame, 40 fixed frames
 local allSlotFrames = {} -- flat list of the same 40, for drop-target hit-testing
 
+local unassignedGroup = nil
+local unassignedScrollFrame = nil
 local unassignedContent = nil
 local unassignedTokenPool = {}
 
@@ -152,6 +154,12 @@ end
 local function OnUnassignedDragStop(self)
   self:StopMovingOrSizing()
   self:SetFrameStrata(RESTING_STRATA)
+  -- Undo SetupTokenDrag's escape to UIParent (see its own comment) now that
+  -- the drag is over, so this token's clipping/scrolling as part of the
+  -- unassigned pool resumes normally - whether or not the drop actually
+  -- landed, the very next RefreshGroupsWindow below will either reposition
+  -- this token back into the pool or hide it if it's no longer unassigned.
+  self:SetParent(unassignedContent)
 
   local target = ResolveDropTarget(self)
   if target then
@@ -178,6 +186,24 @@ local function SetupDrag(frame)
   frame:SetMovable(true)
   frame:RegisterForDrag("LeftButton")
   frame:SetScript("OnDragStart", function(self)
+    self:SetFrameStrata("TOOLTIP")
+    self:StartMoving()
+  end)
+end
+
+-- Same drag behavior as SetupDrag, but for tokens specifically: they live
+-- inside the unassigned pool's scroll frame (see BuildGroupsFrame's
+-- unassignedGroup), and a Blizzard ScrollFrame clips everything parented under
+-- it to its own visible rect regardless of frame strata - so a token
+-- dragged toward a group slot elsewhere in the window would otherwise
+-- vanish the instant it crossed the pool's edge. Escaping to UIParent for
+-- the duration of the drag sidesteps that; OnUnassignedDragStop puts it
+-- back under unassignedContent once the drag ends.
+local function SetupTokenDrag(frame)
+  frame:SetMovable(true)
+  frame:RegisterForDrag("LeftButton")
+  frame:SetScript("OnDragStart", function(self)
+    self:SetParent(UIParent)
     self:SetFrameStrata("TOOLTIP")
     self:StartMoving()
   end)
@@ -242,8 +268,15 @@ end
 -- are still recognizable once they're dragged into/out of a group slot.
 local BENCH_MARKER_R, BENCH_MARKER_G, BENCH_MARKER_B = 0.6, 0.6, 0.6
 
+-- Same typeface as the player name text (TOKEN_FONT_FILE - the default chat
+-- font, Fonts\ARIALN.TTF, same file SlotBaseFont derives from too) instead
+-- of GameFontNormalSmall's own Friz Quadrata family - kept at
+-- GameFontNormalSmall's own size/flags, so only the typeface changes.
+local _, BENCH_MARKER_FONT_HEIGHT, BENCH_MARKER_FONT_FLAGS = GameFontNormalSmall:GetFont()
+
 local function AddBenchMarker(f)
-  local marker = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  local marker = f:CreateFontString(nil, "OVERLAY")
+  marker:SetFont(TOKEN_FONT_FILE, BENCH_MARKER_FONT_HEIGHT, BENCH_MARKER_FONT_FLAGS)
   marker:SetPoint("RIGHT", f, "RIGHT", -4, 0)
   marker:SetText("B")
   marker:SetTextColor(BENCH_MARKER_R, BENCH_MARKER_G, BENCH_MARKER_B)
@@ -266,6 +299,9 @@ end
 -- CreateEditableSlot below).
 local function CreateTokenFrame(parent)
   local f = CreateFrame("Button", nil, parent)
+  -- Width is just an initial placeholder (avoids a zero-width frame before
+  -- the first refresh) - every refresh resizes it to fill the pool's actual
+  -- current width instead, see DoRefreshGroupsWindow's tokenWidth.
   f:SetSize(SLOT_WIDTH, SLOT_HEIGHT)
   f:SetFrameStrata(RESTING_STRATA)
 
@@ -287,7 +323,7 @@ local function CreateTokenFrame(parent)
   text:SetWordWrap(false)
   f.text = text
 
-  SetupDrag(f)
+  SetupTokenDrag(f)
 
   return f
 end
@@ -691,9 +727,23 @@ local function DoRefreshGroupsWindow()
     end
   end
 
+  -- Tokens fill the pool's actual current width instead of a fixed
+  -- SLOT_WIDTH - GetWidth() only reflects real, laid-out geometry once
+  -- AceGUI has run layout at least once, which is already true by the time
+  -- this runs (BuildGroupsFrame calls RefreshGroupsWindow itself right after
+  -- creating the frame); the SLOT_WIDTH fallback just guards the
+  -- off-chance that isn't true yet.
+  local tokenWidth = unassignedScrollFrame:GetWidth()
+  if not tokenWidth or tokenWidth <= 0 then
+    tokenWidth = SLOT_WIDTH
+  end
+  unassignedContent:SetWidth(tokenWidth)
+
   local unassigned = ComputeUnassignedWithExtras(rosterList, comp, groupSet)
+  unassignedGroup:SetTitle(("Unassigned (%d)"):format(#unassigned))
   for i, name in ipairs(unassigned) do
     local token = AcquireUnassignedToken(i)
+    token:SetWidth(tokenWidth)
     token.playerName = name
     SetTokenDisplay(token, name, classMap, groupSet, benchSet)
     token:ClearAllPoints()
@@ -703,6 +753,13 @@ local function DoRefreshGroupsWindow()
   for i = #unassigned + 1, #unassignedTokenPool do
     unassignedTokenPool[i]:Hide()
   end
+
+  -- Resize the scroll child to fit exactly the tokens actually shown, so
+  -- unassignedScrollFrame's own scrollbar range (set automatically by
+  -- ScrollFrameTemplate off this frame's height vs the scrollframe's) always
+  -- matches the current unassigned count instead of a stale one from before
+  -- someone got added/removed.
+  unassignedContent:SetHeight(math.max(#unassigned * (SLOT_HEIGHT + SLOT_GAP), 1))
 
   RefreshCompList(data)
 
@@ -764,11 +821,17 @@ local function BuildGroupsFrame()
   -- remember window position across sessions.
   MakeIdiotsAppearDB.windowStatus.groups = MakeIdiotsAppearDB.windowStatus.groups or {}
   f:SetStatusTable(MakeIdiotsAppearDB.windowStatus.groups)
-  f:SetWidth(800)
+  -- 15px wider than the original 800 - all of it goes to unassignedGroup below,
+  -- which needed the extra room once it got its own real scrollbar (see
+  -- unassignedScrollFrame) - the bar's track sits inset from the
+  -- scrollframe's own right edge rather than fully outside it, and the
+  -- original width left too little clearance between that and a token's
+  -- rightmost content (namely the bench "B" marker).
+  f:SetWidth(815)
   f:SetHeight(680)
 
   -- Deliberately never AceGUI:Release()'d, unlike the addon's other windows:
-  -- releasing would recycle leftGroup/centerGroup/rightGroup (and the box
+  -- releasing would recycle leftGroup/unassignedGroup/rightGroup (and the box
   -- backdrop, apply button, status label) back into AceGUI's shared widget
   -- pool, but those hold plain Blizzard frames (the group boxes, 40 slots,
   -- unassigned tokens) parented directly onto their .content frames that
@@ -790,12 +853,14 @@ local function BuildGroupsFrame()
   leftGroup:SetTitle("Groups")
   -- Left blank ("List" default, never given any AceGUI children - the group
   -- grid below is raw frames parented straight to leftGroup.content).
-  -- Deliberately left a hair under 0.47/0.24/0.29 (rather than summing to
-  -- exactly 1.0) - see UI_Rosters.lua's leftGroup for why: AceGUI's "Flow"
-  -- layout (used by this window's outer frame) can wrap a child to a new row
-  -- if pixel-rounding pushes the combined width a fraction over the
-  -- container's.
-  leftGroup:SetRelativeWidth(0.46)
+  -- Deliberately left a hair under 1.0 when summed with unassignedGroup/
+  -- rightGroup below (0.45 + 0.245 + 0.275 = 0.97) - see UI_Rosters.lua's
+  -- leftGroup for why: AceGUI's "Flow" layout (used by this window's outer
+  -- frame) can wrap a child to a new row if pixel-rounding pushes the
+  -- combined width a fraction over the container's. Kept at roughly its
+  -- original absolute pixel width even though the window itself grew 15px
+  -- (see f:SetWidth above) - only unassignedGroup was meant to gain that room.
+  leftGroup:SetRelativeWidth(0.45)
   leftGroup.noAutoHeight = true
   leftGroup:SetHeight(PANEL_HEIGHT)
   f:AddChild(leftGroup)
@@ -813,16 +878,63 @@ local function BuildGroupsFrame()
   -- Center: unassigned pool
   ----------------------------------------------------------------
 
-  local centerGroup = AceGUI:Create("InlineGroup")
-  centerGroup:SetTitle("Unassigned")
+  unassignedGroup = AceGUI:Create("InlineGroup")
+  unassignedGroup:SetTitle("Unassigned")
   -- Same as leftGroup above - no AceGUI children, tokens are raw frames.
-  -- See leftGroup's own comment for why this is 0.23, not 0.24.
-  centerGroup:SetRelativeWidth(0.23)
-  centerGroup.noAutoHeight = true
-  centerGroup:SetHeight(PANEL_HEIGHT)
-  f:AddChild(centerGroup)
+  -- ~15px wider (in absolute terms) than before the window itself grew to
+  -- make room for it - see leftGroup's own comment and f:SetWidth above.
+  unassignedGroup:SetRelativeWidth(0.245)
+  unassignedGroup.noAutoHeight = true
+  unassignedGroup:SetHeight(PANEL_HEIGHT)
+  f:AddChild(unassignedGroup)
 
-  unassignedContent = centerGroup.content
+  -- A real Blizzard ScrollFrame (rather than another raw-frame trick like
+  -- the group grid above) - unlike the fixed 40-slot grid, the unassigned
+  -- pool's row count varies with roster size and can otherwise overflow
+  -- past the bottom of the panel. UIPanelScrollFrameTemplate wires up mouse
+  -- wheel scrolling and the scrollbar's range automatically off the scroll
+  -- child's height (set every refresh below), same template AceGUI's own
+  -- MultiLineEditBox uses under the hood for playersBox in UI_Rosters.lua.
+  -- Needs an explicit name (nil won't do) since the template's scrollbar is
+  -- anchored via "$parent" substitution - safe as a fixed global name since
+  -- groupsFrame (and so this) is only ever built once per session.
+  unassignedScrollFrame = CreateFrame("ScrollFrame", "MakeIdiotsAppearUnassignedScrollFrame", unassignedGroup.content,
+    "UIPanelScrollFrameTemplate")
+  unassignedScrollFrame:SetPoint("TOPLEFT", unassignedGroup.content, "TOPLEFT", 0, 0)
+  -- Only -2 now (was -22) - the scrollbar itself is hidden below, so this no
+  -- longer needs to leave room for its visible track/thumb, just a hair of
+  -- breathing room so tokens don't butt right up against the panel edge.
+  unassignedScrollFrame:SetPoint("BOTTOMRIGHT", unassignedGroup.content, "BOTTOMRIGHT", -2, 0)
+
+  -- Permanently hide the template's scrollbar (track, thumb, and up/down
+  -- buttons, all children of this Slider so hiding it hides them too) - it
+  -- was always visible even when every token fit without scrolling, and ate
+  -- ~20px of width permanently reserved for it (see the -22 this replaced
+  -- above). A plain :Hide() alone isn't enough: the template's own
+  -- OnScrollRangeChanged re-Show()s this bar itself the moment
+  -- unassignedContent's height overflows the scrollframe's (which is most
+  -- of the time - see DoRefreshGroupsWindow, run on every refresh), undoing
+  -- a one-off Hide() call almost immediately. Overriding Show as a no-op
+  -- short-circuits that for good, since it's a plain Lua method call on this
+  -- object and instance-level functions win over the inherited one.
+  -- Mouse wheel scrolling still works without it: ScrollFrameTemplate's own
+  -- OnMouseWheel handler drives this slider's value programmatically via
+  -- SetValue, which still fires OnValueChanged (and so still scrolls the
+  -- content) regardless of the slider's own visibility - only *dragging the
+  -- thumb by hand* stops working, and there was never a visible thumb left
+  -- to drag once this is hidden anyway. EnableMouse(false) on top makes sure
+  -- the invisible slider can't still eat clicks meant for the row underneath
+  -- it. Named lookup (rather than a return value) because
+  -- UIPanelScrollFrameTemplate creates the bar itself at CreateFrame time -
+  -- same pattern AceGUI's own MultiLineEditBox uses for this exact template.
+  local unassignedScrollBar = _G[unassignedScrollFrame:GetName() .. "ScrollBar"]
+  unassignedScrollBar.Show = function() end
+  unassignedScrollBar:Hide()
+  unassignedScrollBar:EnableMouse(false)
+
+  unassignedContent = CreateFrame("Frame", "MakeIdiotsAppearUnassignedScrollChild", unassignedScrollFrame)
+  unassignedContent:SetSize(SLOT_WIDTH, 1) -- both recalculated every refresh, see DoRefreshGroupsWindow's tokenWidth
+  unassignedScrollFrame:SetScrollChild(unassignedContent)
   unassignedTokenPool = {}
 
   ----------------------------------------------------------------
@@ -832,8 +944,9 @@ local function BuildGroupsFrame()
   local rightGroup = AceGUI:Create("InlineGroup")
   rightGroup:SetTitle("Compositions")
   rightGroup:SetLayout("List")
-  -- See leftGroup's own comment above for why this is 0.28, not 0.29.
-  rightGroup:SetRelativeWidth(0.28)
+  -- See leftGroup's own comment above - kept at roughly its original
+  -- absolute pixel width, same as leftGroup.
+  rightGroup:SetRelativeWidth(0.275)
   rightGroup.noAutoHeight = true
   rightGroup:SetHeight(PANEL_HEIGHT)
   f:AddChild(rightGroup)
