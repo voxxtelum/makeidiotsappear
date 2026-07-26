@@ -51,7 +51,7 @@ local ACTIVE_STATUS_SORT_RANK = {
 
 local mainFrame = nil
 local leftGroup, playerScroll, engineStatusLabel, countdownLabel, startBtn
-local lootThresholdBtn, lootThresholdDropdown
+local lootThresholdBtn, lootThresholdDropdown, disbandBtn
 local benchLabel, benchScroll
 
 local ROW_GAP = 2
@@ -399,17 +399,20 @@ local function RefreshCountdown()
   end
 end
 
--- Only :Show()/:Hide()s the button/dropdown rather than adding/removing
--- them from rightGroup's "List" layout - the space they occupy always
--- stays reserved (see BuildMainFrame's spacer math below), so Start/Stop
--- and everything else never shifts as leadership/group membership changes.
+-- Only :Show()/:Hide()s the button/dropdown/disband button rather than
+-- adding/removing them from rightGroup's "List" layout - the space they
+-- occupy always stays reserved (see BuildMainFrame's spacer math below), so
+-- Start/Stop and everything else never shifts as leadership/group
+-- membership changes.
 local function RefreshLootThresholdControls()
   if IsInGroup() and UnitIsGroupLeader("player") then
     lootThresholdBtn.frame:Show()
     lootThresholdDropdown.frame:Show()
+    disbandBtn.frame:Show()
   else
     lootThresholdBtn.frame:Hide()
     lootThresholdDropdown.frame:Hide()
+    disbandBtn.frame:Hide()
   end
 end
 
@@ -421,6 +424,15 @@ local function RefreshAll()
   RefreshLootThresholdControls()
 end
 ns.RegisterListener(RefreshAll)
+
+StaticPopupDialogs["MAKEIDIOTSAPPEAR_CONFIRM_DISBAND_RAID"] = {
+  text = "Are you sure you want to disband the group?",
+  button1 = "Disband",
+  button2 = "Cancel",
+  OnAccept = function() ns.DisbandGroup() end,
+  whileDead = 1,
+  hideOnEscape = 1,
+}
 
 local refreshTicker = nil
 local countdownTicker = nil
@@ -633,14 +645,15 @@ local function BuildMainFrame()
   end)
   rightGroup:AddChild(groupsBtn)
 
-  -- Manual loot threshold controls - only usable by the raid leader, so
-  -- RefreshLootThresholdControls (called from RefreshAll) hides/shows the
-  -- button and dropdown as group/leader status changes. They stay in
-  -- rightGroup's "List" stack at all times (just invisible when hidden) so
-  -- Start/Stop and everything else below never shifts - see
+  -- Leader-only controls (manual loot threshold + disband) - only usable by
+  -- the raid leader, so RefreshLootThresholdControls (called from
+  -- RefreshAll) hides/shows them as group/leader status changes. They stay
+  -- in rightGroup's "List" stack at all times (just invisible when hidden)
+  -- so Start/Stop and everything else below never shifts - see
   -- RefreshLootThresholdControls's own comment for why Hide()/Show() is
   -- enough here rather than AddChild/ReleaseChildren.
   local LOOT_THRESHOLD_DROPDOWN_HEIGHT = 26 -- AceGUI Dropdown's own unlabeled height, see AceGUIWidget-Dropdown.lua's SetLabel
+
   local lootThresholdSpacer = AceGUI:Create("SimpleGroup")
   lootThresholdSpacer:SetFullWidth(true)
   lootThresholdSpacer.noAutoHeight = true
@@ -670,19 +683,39 @@ local function BuildMainFrame()
   end)
   rightGroup:AddChild(lootThresholdDropdown)
 
+  -- One button height of blank space between the dropdown and disbandBtn
+  -- below, same reserved-space treatment as lootThresholdSpacer above -
+  -- always present regardless of disbandBtn's own shown/hidden state.
+  local disbandSpacer = AceGUI:Create("SimpleGroup")
+  disbandSpacer:SetFullWidth(true)
+  disbandSpacer.noAutoHeight = true
+  disbandSpacer:SetHeight(BUTTON_HEIGHT)
+  rightGroup:AddChild(disbandSpacer)
+
+  disbandBtn = AceGUI:Create("Button")
+  disbandBtn:SetText("Disband Group")
+  disbandBtn:SetFullWidth(true)
+  disbandBtn:SetHeight(BUTTON_HEIGHT)
+  ns.ShrinkButtonFont(disbandBtn)
+  disbandBtn:SetCallback("OnClick", function()
+    StaticPopup_Show("MAKEIDIOTSAPPEAR_CONFIRM_DISBAND_RAID")
+  end)
+  rightGroup:AddChild(disbandBtn)
+
   -- "List" layout just stacks children top-down with no auto-fill, so a
   -- blank spacer is what pushes Start/Stop down to the bottom of the panel.
   -- (A Label won't hold a forced height - it recalculates itself from its
   -- text on every SetText/SetWidth. SimpleGroup respects noAutoHeight.) The
   -- spacer is shortened by the two button gaps above, the loot threshold
-  -- block above, and the countdown container reserved below, so Start/Stop
-  -- lands in the same spot regardless of any of those being hidden/shown.
+  -- block above, disbandSpacer+disbandBtn, and the countdown container
+  -- reserved below, so Start/Stop lands in the same spot regardless of any
+  -- of those being hidden/shown.
   local COUNTDOWN_HEIGHT = 14
   local spacer = AceGUI:Create("SimpleGroup")
   spacer:SetFullWidth(true)
   spacer.noAutoHeight = true
   spacer:SetHeight(300 - (2 * BUTTON_GAP) - COUNTDOWN_HEIGHT
-    - BUTTON_HEIGHT - BUTTON_HEIGHT - LOOT_THRESHOLD_DROPDOWN_HEIGHT)
+    - BUTTON_HEIGHT - BUTTON_HEIGHT - LOOT_THRESHOLD_DROPDOWN_HEIGHT - BUTTON_HEIGHT - BUTTON_HEIGHT)
   rightGroup:AddChild(spacer)
 
   -- Label always left-justifies its text with no built-in way to change

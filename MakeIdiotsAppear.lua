@@ -1428,6 +1428,41 @@ MaybeAutoPromoteAssist = function()
   end
 end
 
+----------------------------------------------------------------------
+-- Disband raid/group
+----------------------------------------------------------------------
+-- There's no single Blizzard API for this: uninvite everyone else in the
+-- group, then leave it ourselves - a group of 1 (or 0) dissolves on its own.
+
+local function DisbandGroup()
+  if InCombatLockdown() then return end -- avoid Blizzard's protected-action error mid-combat
+
+  local myIndex = UnitInRaid("player")
+  if myIndex then
+    local _, myRank = GetRaidRosterInfo(myIndex)
+    if myRank == 2 then -- real raid leader, not just an assist
+      for i = 1, GetNumGroupMembers() do
+        if i ~= myIndex then
+          local name = GetRaidRosterInfo(i)
+          if name then
+            UninviteUnit(name)
+          end
+        end
+      end
+    end
+  elseif UnitIsGroupLeader("player") then
+    for i = MAX_PARTY_MEMBERS, 1, -1 do
+      local name = UnitName("party" .. i)
+      if name then
+        UninviteUnit(name)
+      end
+    end
+  end
+
+  LeaveParty()
+end
+ns.DisbandGroup = DisbandGroup
+
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("CHAT_MSG_SYSTEM")
 eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
