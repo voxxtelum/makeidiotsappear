@@ -1,6 +1,7 @@
 ignore:
     - .github
     - .vscode
+    - scripts
     - README.md
     - CHANGELOG.md
     - LICENSE
