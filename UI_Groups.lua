@@ -81,6 +81,7 @@ local unassignedContent = nil
 local unassignedTokenPool = {}
 
 local compListScroll = nil
+local deleteBtn = nil
 local applyBtn = nil
 local applyStatusLabel = nil
 
@@ -817,6 +818,12 @@ local function DoRefreshGroupsWindow()
 
   RefreshCompList(data)
 
+  -- Mirrors DeleteGroupComp's own "can't delete the only composition" guard
+  -- (see the confirm-delete popup's OnAccept above) - disabled up front here
+  -- instead of just relying on that guard, so it's not clickable at all when
+  -- it would just print a rejection.
+  deleteBtn:SetDisabled(#data.comps <= 1)
+
   local engine = ns.GroupApplyEngine
   if engine.pending then
     applyBtn:SetDisabled(true)
@@ -1008,28 +1015,49 @@ local function BuildGroupsFrame()
   compListScroll = AceGUI:Create("ScrollFrame")
   compListScroll:SetLayout("List")
   compListScroll:SetFullWidth(true)
-  -- Reserves room below the list for New/Duplicate, Rename/Delete, the 20px
-  -- spacer, and Apply Groups + its status label - trimmed tighter than a
-  -- generic guess would be, to help keep the window height down now that
-  -- Apply Groups lives here instead of under the (much taller) group grid.
-  compListScroll:SetHeight(PANEL_HEIGHT - 150)
+  -- Reserves room below the list for the New row, Reset/Duplicate,
+  -- Rename/Delete, the 20px spacer, and Apply Groups + its status label -
+  -- trimmed tighter than a generic guess would be, to help keep the window
+  -- height down now that Apply Groups lives here instead of under the (much
+  -- taller) group grid.
+  compListScroll:SetHeight(PANEL_HEIGHT - 175)
   rightGroup:AddChild(compListScroll)
 
-  local btnRow1 = AceGUI:Create("SimpleGroup")
-  btnRow1:SetLayout("Flow")
-  btnRow1:SetFullWidth(true)
-  rightGroup:AddChild(btnRow1)
+  local newRow = AceGUI:Create("SimpleGroup")
+  newRow:SetLayout("Flow")
+  newRow:SetFullWidth(true)
+  rightGroup:AddChild(newRow)
 
   local newBtn = AceGUI:Create("Button")
   newBtn:SetText("New")
-  newBtn:SetWidth(95)
+  newBtn:SetRelativeWidth(0.99)
   newBtn:SetHeight(20)
   ns.ShrinkButtonFont(newBtn)
   newBtn:SetCallback("OnClick", function()
     ns.AddGroupComp(currentRosterName, "New Composition")
     RefreshGroupsWindow()
   end)
-  btnRow1:AddChild(newBtn)
+  newRow:AddChild(newBtn)
+
+  local btnRow1 = AceGUI:Create("SimpleGroup")
+  btnRow1:SetLayout("Flow")
+  btnRow1:SetFullWidth(true)
+  rightGroup:AddChild(btnRow1)
+
+  local resetBtn = AceGUI:Create("Button")
+  resetBtn:SetText("Reset")
+  resetBtn:SetWidth(95)
+  resetBtn:SetHeight(20)
+  ns.ShrinkButtonFont(resetBtn)
+  resetBtn:SetCallback("OnClick", function()
+    -- Re-chunks the active composition's groups from the roster's current
+    -- player-list order, same as ns.ResetDefaultGroupComp does for Default -
+    -- discards any manual drag/edit arrangement in this composition.
+    local comp = GetComp()
+    comp.groups = ns.ChunkListIntoGroups(GetRosterList())
+    RefreshGroupsWindow()
+  end)
+  btnRow1:AddChild(resetBtn)
 
   local duplicateBtn = AceGUI:Create("Button")
   duplicateBtn:SetText("Duplicate")
@@ -1065,7 +1093,7 @@ local function BuildGroupsFrame()
   end)
   btnRow2:AddChild(renameBtn)
 
-  local deleteBtn = AceGUI:Create("Button")
+  deleteBtn = AceGUI:Create("Button")
   deleteBtn:SetText("Delete")
   deleteBtn:SetWidth(95)
   deleteBtn:SetHeight(20)
