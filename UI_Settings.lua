@@ -83,6 +83,11 @@ ns.BuildLootThresholdDropdownList = BuildLootThresholdDropdownList
 -- no per-keystroke "committed" signal for those) is the only place a value
 -- ever gets persisted.
 local function BuildInvitesTab(container, settings)
+  -- Forward-declared so the slider's OnValueChanged (defined next) can call
+  -- it as an upvalue - the function body itself is assigned further below,
+  -- once intervalWarningText exists.
+  local UpdateIntervalWarning
+
   local intervalSlider = AceGUI:Create("Slider")
   intervalSlider:SetLabel("Invite interval (seconds)")
   intervalSlider:SetSliderValues(15, 600, 5)
@@ -90,14 +95,41 @@ local function BuildInvitesTab(container, settings)
   intervalSlider:SetFullWidth(true)
   intervalSlider:SetCallback("OnValueChanged", function(widget, event, value)
     settings.interval = math.floor(value + 0.5)
+    UpdateIntervalWarning(settings.interval)
   end)
   container:AddChild(intervalSlider)
 
-  local intervalSpacer = AceGUI:Create("SimpleGroup")
-  intervalSpacer:SetFullWidth(true)
-  intervalSpacer.noAutoHeight = true
-  intervalSpacer:SetHeight(SECTION_SPACER_HEIGHT)
-  container:AddChild(intervalSpacer)
+  -- Reserves the same fixed height the old plain spacer occupied here,
+  -- regardless of whether the warning text below is currently shown -
+  -- SetShown()'d rather than the row itself being conditionally added/
+  -- skipped, so toggling it never changes this container's layout height
+  -- and never shifts the fields below.
+  local intervalWarningRow = AceGUI:Create("SimpleGroup")
+  intervalWarningRow:SetFullWidth(true)
+  intervalWarningRow.noAutoHeight = true
+  intervalWarningRow:SetHeight(SECTION_SPACER_HEIGHT)
+  container:AddChild(intervalWarningRow)
+
+  -- Raw FontString (not an AceGUI Label, which auto-sizes its frame to the
+  -- text) using the default chat font/color so its height stays fixed and
+  -- toggling it never resizes intervalWarningRow.
+  local intervalWarningText = intervalWarningRow.content:CreateFontString(nil, "OVERLAY", "ChatFontNormal")
+  intervalWarningText:SetPoint("TOP", intervalWarningRow.content, "TOP", 0, 0)
+  intervalWarningText:SetPoint("LEFT", intervalWarningRow.content, "LEFT", 0, 0)
+  intervalWarningText:SetPoint("RIGHT", intervalWarningRow.content, "RIGHT", 0, 0)
+  intervalWarningText:SetJustifyH("CENTER")
+  intervalWarningText:SetTextColor(1, 0, 0)
+  do
+    local fontPath, fontHeight, fontFlags = intervalWarningText:GetFont()
+    intervalWarningText:SetFont(fontPath, fontHeight - 2, fontFlags)
+  end
+  intervalWarningText:SetText(
+    "WARNING: Interval is lower than the group invite timeout period - it will take longer to re-invite players who are AFK.")
+
+  UpdateIntervalWarning = function(value)
+    intervalWarningText:SetShown(value <= 60)
+  end
+  UpdateIntervalWarning(settings.interval)
 
   -- Side-by-side row for the prefix/delay boxes. container:AddChild triggers
   -- an immediate DoLayout (see AceGUI's WidgetContainerBase.AddChild), and on
