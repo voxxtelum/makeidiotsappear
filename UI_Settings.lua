@@ -548,3 +548,14 @@ function ns.ShowSettingsFrame()
   end
   settingsFrame = BuildSettingsFrame()
 end
+
+-- Closes the window if it's already open instead of just re-showing/
+-- refreshing it, for the main frame's Settings button - a second press
+-- toggles it shut rather than being a no-op.
+function ns.ToggleSettingsFrame()
+  if settingsFrame and settingsFrame.frame:IsShown() then
+    settingsFrame.frame:Hide()
+    return
+  end
+  ns.ShowSettingsFrame()
+end

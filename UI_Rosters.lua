@@ -536,3 +536,14 @@ function ns.ShowRosterManagerFrame()
   end
   RefreshGroupSizeSelection()
 end
+
+-- Closes the window if it's already open instead of just re-showing/
+-- refreshing it, for the main frame's Rosters button - a second press
+-- toggles it shut rather than being a no-op.
+function ns.ToggleRosterManagerFrame()
+  if rosterManagerFrame and rosterManagerFrame.frame:IsShown() then
+    rosterManagerFrame.frame:Hide()
+    return
+  end
+  ns.ShowRosterManagerFrame()
+end

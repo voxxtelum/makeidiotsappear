@@ -1138,3 +1138,14 @@ function ns.ShowGroupManagerFrame()
   groupsFrame = BuildGroupsFrame()
   RefreshGroupsWindow()
 end
+
+-- Closes the window if it's already open instead of just re-showing/
+-- refreshing it, for the main frame's Groups button - a second press
+-- toggles it shut rather than being a no-op.
+function ns.ToggleGroupManagerFrame()
+  if groupsFrame and groupsFrame.frame:IsShown() then
+    groupsFrame.frame:Hide()
+    return
+  end
+  ns.ShowGroupManagerFrame()
+end
