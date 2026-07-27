@@ -348,11 +348,16 @@ local function NormalizePlayerName(input)
 
   namePart = ProperCase(trim(namePart))
 
+  -- A realm suffix only counts as resolved if it's one of RealmMap's known
+  -- realms - an unrecognized/misspelled realm (e.g. "-Aztiesh") falls through
+  -- to the masterRoster lookup below just like a missing realm would, rather
+  -- than being accepted as-is via ProperCase.
   local resolvedRealm = nil
   if realmPart then
     realmPart = trim(realmPart)
-    resolvedRealm = RealmMap[realmPart:lower()] or ProperCase(realmPart)
-  else
+    resolvedRealm = RealmMap[realmPart:lower()]
+  end
+  if not resolvedRealm then
     local known = MakeIdiotsAppearDB.masterRoster[namePart:lower()]
     if known then
       resolvedRealm = known
