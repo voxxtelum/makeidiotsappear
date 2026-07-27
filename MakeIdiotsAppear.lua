@@ -615,7 +615,6 @@ local Engine = {
   pendingInvites = {},   -- [lowercased "name-realm"] = fullName, currently invited but not yet confirmed
   pendingInviteSentAt = {}, -- [lowercased "name-realm"] = GetTime() when that invite was sent
   skipped = {},          -- names whispered this pass because they're already in another group, or still missing a realm
-  offlineThisPass = {},  -- names reported offline/nonexistent since the last batched report
   nextPassAt = nil,      -- GetTime() timestamp of the next scheduled invite pass, if any
   convertingToRaid = nil, -- true while waiting on a pending party->raid conversion
   convertRetryCount = 0,  -- how many times we've waited on that conversion so far
@@ -889,16 +888,6 @@ local function CheckNewlyJoinedDurability()
 end
 ns.CheckNewlyJoinedDurability = CheckNewlyJoinedDurability
 
--- Offline/nonexistent targets are reported once, in a single batched
--- message, instead of one print per person - see the CHAT_MSG_SYSTEM
--- handler below, which appends to this list instead of printing directly.
-local function ReportOfflinePlayers()
-  if #Engine.offlineThisPass > 0 then
-    print(PREFIX .. "Players offline: " .. table.concat(Engine.offlineThisPass, ", "))
-    Engine.offlineThisPass = {}
-  end
-end
-
 local function StopInvites(reason)
   if Engine.ticker then
     Engine.ticker:Cancel()
@@ -919,7 +908,6 @@ local function StopInvites(reason)
   Engine.nextPassAt = nil
   Engine.convertingToRaid = nil
   Engine.convertRetryCount = 0
-  ReportOfflinePlayers()
   ReportDurabilityUnknown()
   Engine.durabilityChecked = {}
   if reason then
@@ -1055,11 +1043,9 @@ RunInvitePass = function()
     -- synchronous burst of invites has already finished. So burning a slot
     -- on someone the guild roster already told us is offline can starve a
     -- genuinely online target later in the same queue (see the "party is
-    -- full" bug this was fixed for). Skip the invite call entirely and
-    -- report them the same way a real bounce-back would.
+    -- full" bug this was fixed for). Skip the invite call entirely.
     if nextName and LookupByFullOrName(guildOnline, nextName) == false then
       table.insert(Engine.skipped, nextName)
-      table.insert(Engine.offlineThisPass, nextName)
       nextName = nil
     end
 
@@ -1078,7 +1064,6 @@ RunInvitePass = function()
   FireStateChanged()
 
   CheckNewlyJoinedDurability()
-  ReportOfflinePlayers()
   ReportDurabilityUnknown()
 
   -- this pass is done - see who's still not in the group and try again.
@@ -1163,7 +1148,6 @@ local function StartInvites(list)
     table.insert(Engine.fullRoster, n)
   end
   Engine.skipped = {}
-  Engine.offlineThisPass = {}
   Engine.convertingToRaid = nil
   Engine.convertRetryCount = 0
   Engine.durabilityChecked = {}
@@ -1676,7 +1660,6 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
       local fullName = matched and TakePendingInvite(matched)
       if fullName then
         table.insert(Engine.skipped, fullName)
-        table.insert(Engine.offlineThisPass, fullName)
         RequeueForRetry(fullName)
         FireStateChanged()
         return
