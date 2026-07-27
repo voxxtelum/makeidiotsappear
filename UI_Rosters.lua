@@ -484,7 +484,11 @@ local function BuildRosterManagerFrame()
     local raw = ns.ParsePastedText(playersBox:GetText())
     local cleaned, needsRealm = ns.NormalizeList(raw)
     MakeIdiotsAppearDB.rosters[selectedRoster] = cleaned
-    ns.ResetDefaultGroupComp(selectedRoster, cleaned)
+    -- Seeds Default the first time this roster is saved with at least one
+    -- player - a no-op while cleaned is still empty (e.g. the very first
+    -- save, pressing Enter in nameBox right after "Add Roster" with no
+    -- players typed yet), see EnsureRosterGroupData's own comment for why.
+    ns.EnsureRosterGroupData(selectedRoster, cleaned)
     playersBox:SetText(table.concat(cleaned, "\n"))
     print(PREFIX .. string.format("Saved roster '%s' with %d players.", selectedRoster, #cleaned))
     if #needsRealm > 0 then

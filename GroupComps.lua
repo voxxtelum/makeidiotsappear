@@ -7,13 +7,12 @@
 -- computed live from the roster list vs. a composition's groups, see
 -- ComputeUnassigned below.
 --
--- One composition, "Default", is special: UI_Rosters.lua calls
--- ResetDefaultGroupComp on every roster save, which overwrites it with a
--- fresh chunking of the roster's current player-list order. So Default
--- always mirrors "whatever order the roster is in right now" and any manual
--- rearranging of it will be lost the next time the roster is edited/saved -
--- compositions you want to keep should be duplicated into their own named
--- copy first (see the "Duplicate" button in UI_Groups.lua).
+-- One composition, "Default", is special only in that it's the one
+-- EnsureRosterGroupData seeds automatically (chunked from the roster's
+-- player-list order) the first time a roster is saved/seen with at least one
+-- player. After that it's just an ordinary composition - roster saves in
+-- UI_Rosters.lua no longer touch it, so manual rearranging of Default sticks
+-- across roster edits the same as any other named composition.
 --
 -- Each group (comp.groups[1..8]) is a fixed 5-slot table, addressed by
 -- explicit position 1-5 rather than compacted/appended - an empty slot is
@@ -83,8 +82,16 @@ end
 
 -- Get-or-create the roster's group data, seeding a "Default" composition
 -- (chunked from rosterList's current order) the first time this roster is
--- ever seen. Does NOT otherwise touch Default on later calls - see
--- ResetDefaultGroupComp below for keeping it in sync as the roster changes.
+-- saved/seen with at least one player. Deliberately does NOT seed Default
+-- from an empty rosterList - EnsureRosterGroupData only seeds once (see
+-- below), so seeding it empty (e.g. from GetActiveGroupComp being called to
+-- just display a still-empty roster's Groups window, or from a roster's
+-- very first save before any players are typed) would permanently lock in
+-- an empty Default: a later save with real players would find a comp
+-- already there and skip reseeding, leaving every player stuck in
+-- "unassigned" instead of chunked into groups. Once seeded, Default is
+-- never auto-regenerated - manual rearranging of it sticks across roster
+-- edits the same as any other named composition.
 function ns.EnsureRosterGroupData(rosterName, rosterList)
   ns.EnsureDB()
   local data = MakeIdiotsAppearDB.groupComps[rosterName]
@@ -92,33 +99,22 @@ function ns.EnsureRosterGroupData(rosterName, rosterList)
     data = { activeComp = "Default", comps = {} }
     MakeIdiotsAppearDB.groupComps[rosterName] = data
   end
-  if #data.comps == 0 then
-    table.insert(data.comps, { name = "Default", groups = ChunkListIntoGroups(rosterList or {}) })
+  if #data.comps == 0 and rosterList and #rosterList > 0 then
+    table.insert(data.comps, { name = "Default", groups = ChunkListIntoGroups(rosterList) })
     data.activeComp = "Default"
   end
   return data
 end
 
--- Overwrites (or recreates, at the front of the list, if it was deleted or
--- renamed away) the roster's "Default" composition with a fresh chunking of
--- rosterList's current order. Called every time a roster is saved in
--- UI_Rosters.lua, so Default always mirrors the current player list -
--- unlike every other composition, which is left exactly as arranged and
--- never auto-touched by roster edits.
-function ns.ResetDefaultGroupComp(rosterName, rosterList)
-  local data = ns.EnsureRosterGroupData(rosterName, rosterList)
-  local groups = ChunkListIntoGroups(rosterList or {})
-  local comp = FindComp(data, "Default")
-  if comp then
-    comp.groups = groups
-  else
-    table.insert(data.comps, 1, { name = "Default", groups = groups })
-  end
-end
-
 -- Resolves the roster's active composition, self-healing to the first
 -- composition on the list if the activeComp pointer is stale (e.g. that
--- comp was renamed/deleted through some other path).
+-- comp was renamed/deleted through some other path). Callers can always
+-- assume a non-nil comp back: if the roster has no players saved yet (so
+-- EnsureRosterGroupData hasn't seeded a real Default - see above), this
+-- hands back a transient empty stand-in that mirrors what Default will look
+-- like once seeded for real, without inserting it into data.comps - so it
+-- doesn't count as "already seeded" and a real Default still gets created
+-- the first time the roster is actually saved with players.
 function ns.GetActiveGroupComp(rosterName)
   local rosterList = MakeIdiotsAppearDB.rosters[rosterName] or {}
   local data = ns.EnsureRosterGroupData(rosterName, rosterList)
@@ -126,6 +122,9 @@ function ns.GetActiveGroupComp(rosterName)
   if not comp then
     comp = data.comps[1]
     data.activeComp = comp and comp.name or nil
+  end
+  if not comp then
+    comp = { name = "Default", groups = ChunkListIntoGroups({}) }
   end
   return comp, data
 end

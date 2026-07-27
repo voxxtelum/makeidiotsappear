@@ -406,10 +406,9 @@ end
 
 -- Commits a group slot's in-place edit into comp.groups only - the roster's
 -- saved player list (MakeIdiotsAppearDB.rosters) is never touched here, so
--- this can't be clobbered by (and doesn't affect) a later roster save; only
--- the Default composition gets resynced on save (see
--- ns.ResetDefaultGroupComp), every other composition - including manual
--- edits/additions made here - is left alone. Reuses the same
+-- this can't be clobbered by (and doesn't affect) a later roster save; no
+-- composition, including Default, is auto-touched by a roster save, so
+-- manual edits/additions made here are left alone. Reuses the same
 -- ns.NormalizePlayerName the roster editor uses, so a bare name gets
 -- resolved against the master roster (learned from people who've actually
 -- been in your group/guild) exactly the same way, and still gets flagged if
@@ -1126,8 +1125,9 @@ local function BuildGroupsFrame()
   ns.ShrinkButtonFont(resetBtn)
   resetBtn:SetCallback("OnClick", function()
     -- Re-chunks the active composition's groups from the roster's current
-    -- player-list order, same as ns.ResetDefaultGroupComp does for Default -
-    -- discards any manual drag/edit arrangement in this composition.
+    -- player-list order, discarding any manual drag/edit arrangement in this
+    -- composition (this is the only way Default - or any other comp - gets
+    -- resynced to the roster's order now; roster saves no longer do it).
     local comp = GetComp()
     comp.groups = ns.ChunkListIntoGroups(GetRosterList())
     RefreshGroupsWindow()
