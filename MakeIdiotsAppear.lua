@@ -1582,6 +1582,8 @@ eventFrame:RegisterEvent("CHAT_MSG_SYSTEM")
 eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
 eventFrame:RegisterEvent("GUILD_ROSTER_UPDATE")
 eventFrame:RegisterEvent("ADDON_LOADED")
+eventFrame:RegisterEvent("PARTY_LEADER_CHANGED")
+eventFrame:RegisterEvent("PLAYER_LOGOUT")
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
   if event == "ADDON_LOADED" then
@@ -1590,6 +1592,34 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
       EnsureDB()
       if IsInGuild() then RequestGuildRoster() end
       FireStateChanged()
+    end
+    return
+  end
+
+  if event == "PARTY_LEADER_CHANGED" then
+    if Engine.running or Engine.starting then
+      if IsInGroup() or IsInRaid() then
+        if not UnitIsGroupLeader("player") then
+          -- Leadership changed hands (given away, or someone else took it) -
+          -- everything from raid conversion to loot method needs the
+          -- leader, so there's nothing left this run can do.
+          StopInvites("Stopped - you're no longer the group/raid leader.")
+        end
+      else
+        -- Group dissolved out from under the run entirely.
+        StopInvites("Stopped - you're no longer in a group.")
+      end
+    end
+    return
+  end
+
+  if event == "PLAYER_LOGOUT" then
+    -- Logging out/exiting/reloading UI - nothing can continue past this
+    -- point, so stop cleanly (flush any batched offline/durability reports)
+    -- rather than leaving the run in a running state that never actually
+    -- resumes.
+    if Engine.running or Engine.starting then
+      StopInvites("Stopped - logging out.")
     end
     return
   end
