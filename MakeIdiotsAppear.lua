@@ -1711,9 +1711,8 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
   if event == "PLAYER_LOGOUT" then
     -- Logging out/exiting/reloading UI - nothing can continue past this
-    -- point, so stop cleanly (flush any batched offline/durability reports)
-    -- rather than leaving the run in a running state that never actually
-    -- resumes.
+    -- point, so stop cleanly (flush any batched durability reports) rather
+    -- than leaving the run in a running state that never actually resumes.
     if Engine.running or Engine.starting then
       StopInvites("Stopped - logging out.")
     end
