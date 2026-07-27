@@ -460,6 +460,28 @@ local function BuildRosterManagerFrame()
   playersBox:SetNumLines(24)
   rightGroup:AddChild(playersBox)
 
+  -- Ctrl+Enter saves the roster without leaving the player list. AceGUI's
+  -- MultiLineEditBox has no OnEnterPressed keybind of its own for plain
+  -- Enter (that key just inserts a newline, needed for multi-line input) -
+  -- this hooks the underlying Blizzard EditBox's OnKeyDown directly instead.
+  -- ClearFocus() before SaveRoster() (not after) is what stops the plain
+  -- newline that would otherwise still get inserted once this handler
+  -- returns - same trick other "Enter submits" multi-line boxes use.
+  playersBox.editBox:HookScript("OnKeyDown", function(self, key)
+    if key == "ENTER" and IsControlKeyDown() then
+      self:ClearFocus()
+      -- The engine still inserts Enter's default newline into this
+      -- multi-line box after this handler returns, regardless of
+      -- ClearFocus() above - landing at position 0 specifically because
+      -- AceGUI's SetText always resets the cursor there (see OnTextSet in
+      -- AceGUIWidget-MultiLineEditBox.lua). Deferring SaveRoster (which
+      -- rewrites the box via SetText) by one frame, instead of calling it
+      -- inline here, lets our authoritative text land *after* that stray
+      -- insertion so it overwrites it rather than racing it.
+      C_Timer.After(0, SaveRoster)
+    end
+  end)
+
   -- Pushes Save Roster/Set Active down those extra few px so they line up
   -- with Add Roster/Delete Roster on the left (see leftSpacer above).
   local rightSpacer = AceGUI:Create("SimpleGroup")
