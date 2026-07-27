@@ -958,6 +958,13 @@ local SafeRunInvitePass
 -- actual roster change after that point.
 local MaybeAutoPromoteAssist
 
+-- Forward-declared for the same reason as MaybeAutoPromoteAssist above -
+-- StartInvites (below) needs to run this once immediately too, to catch an
+-- already-existing real party formed before Start Invites was clicked; its
+-- other call site is the joinedGroupPattern branch in the CHAT_MSG_SYSTEM
+-- handler, further down still.
+local MaybeConvertToRaid
+
 -- Forward-declared so RunInvitePass (defined above the real body of this
 -- function) can call it - the real body needs ClearPendingInvite, which is
 -- only defined later alongside TakePendingInvite.
@@ -1172,6 +1179,15 @@ local function StartInvites(list)
   -- otherwise never see someone who was already there.
   MaybeAutoPromoteAssist()
 
+  -- Same reasoning: catches an already-existing real party of 2+ formed
+  -- before Start Invites was clicked, which the joinedGroupPattern-driven
+  -- trigger (CHAT_MSG_SYSTEM handler) would never see since no fresh "has
+  -- joined" message fires for people who were already there. Safe to read
+  -- GetNumGroupMembers() directly here specifically because no invites have
+  -- been sent yet this run - there's no reserved-but-unconfirmed slot to be
+  -- fooled by at this exact point.
+  MaybeConvertToRaid()
+
   -- Backstop for durability checks: GROUP_ROSTER_UPDATE already triggers a
   -- check whenever someone joins, but this catches anyone whose request
   -- got dropped by LibDurability's own broadcast throttle.
@@ -1237,6 +1253,16 @@ end
 local declinedPattern
 if ERR_DECLINE_GROUP_S then
   declinedPattern = "^" .. ERR_DECLINE_GROUP_S:gsub("%%s", "(.+)") .. "$"
+end
+
+-- ERR_JOINED_GROUP_S looks like "%s has joined the group." - unlike
+-- GROUP_ROSTER_UPDATE/GetNumGroupMembers(), which can transiently reflect a
+-- reserved-but-unconfirmed invite slot before the client catches up to a
+-- failed invite (see MaybeConvertToRaid), this message only ever fires for
+-- a genuine, confirmed acceptance.
+local joinedGroupPattern
+if ERR_JOINED_GROUP_S then
+  joinedGroupPattern = "^" .. ERR_JOINED_GROUP_S:gsub("%%s", "(.+)") .. "$"
 end
 
 -- WoW group invites expire after 60s (confirmed by testing in-game) - add a
@@ -1361,13 +1387,14 @@ PruneExpiredPendingInvites = function()
   end
 end
 
--- Converts as soon as it's actually possible (2+ confirmed members) rather
--- than waiting until the party is nearly full - by the time RunInvitePass's
--- own capacity check would otherwise trigger a conversion, the group has
--- almost always already converted here. Only fires while a run is active
--- and only for the leader, same restriction ConvertPartyToRaid itself is
--- subject to - see StartInvites' upfront leadership check.
-local function MaybeConvertToRaid()
+-- Triggered by a confirmed join (joinedGroupPattern in the CHAT_MSG_SYSTEM
+-- handler) or, once, immediately from StartInvites for an already-existing
+-- party - deliberately NOT from GROUP_ROSTER_UPDATE's generic member count,
+-- which can transiently reflect a reserved-but-unconfirmed invite slot
+-- before the client catches up to a failed invite. Only fires while a run
+-- is active and only for the leader, same restriction ConvertPartyToRaid
+-- itself is subject to - see StartInvites' upfront leadership check.
+MaybeConvertToRaid = function()
   if not Engine.running then return end
   if IsInRaid() then return end
   if not UnitIsGroupLeader("player") then return end
@@ -1577,7 +1604,11 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
     PruneJoinedFromQueues(groupSet)
     CheckNewlyJoinedDurability()
     ns.OnGroupRosterUpdateForApplyEngine()
-    MaybeConvertToRaid()
+    -- Raid conversion is deliberately NOT triggered here - GetNumGroupMembers()
+    -- can transiently reflect a reserved-but-unconfirmed invite slot before
+    -- the client catches up to a failed invite, which was causing conversion
+    -- to fire on phantom membership. See the joinedGroupPattern branch in the
+    -- CHAT_MSG_SYSTEM handler below, which only trusts a confirmed join.
     MaybeSetMasterLoot()
     MaybeSetLootThreshold()
     MaybeSetMasterLooter()
@@ -1631,6 +1662,15 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         FireStateChanged()
         return
       end
+    end
+
+    if joinedGroupPattern and msg:match(joinedGroupPattern) then
+      -- A confirmed join, not just a roster snapshot that might still be
+      -- reflecting a reserved-but-unconfirmed invite slot - safe to trust
+      -- for raid conversion. No need to pull the name out here; unlike the
+      -- bounce branches above we don't need to know who, just that someone
+      -- genuinely joined.
+      MaybeConvertToRaid()
     end
   end
 end)
