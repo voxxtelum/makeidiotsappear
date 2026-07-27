@@ -1096,6 +1096,14 @@ RunInvitePass = function()
   -- does NOT necessarily mean everyone has joined, only that nobody needs a
   -- new invite yet. Check actual group membership separately to decide
   -- whether the run is really done.
+  --
+  -- Deliberately NOT touching Engine.nextPassAt here - a pass can finish
+  -- well before the interval's actually up (e.g. the 1.5s capacity-retry
+  -- chain resolving quickly), and recomputing "now + interval" from that
+  -- early completion time would show a countdown longer than what's really
+  -- going to happen. The ticker in StartInvites fires on its own fixed
+  -- schedule regardless of when any given pass happens to finish, so it's
+  -- the only thing that gets to set nextPassAt.
   local stragglers = ComputeStragglers()
   local currentGroupSet = GetGroupNameSet()
   local everyoneJoined = true
@@ -1115,7 +1123,6 @@ RunInvitePass = function()
       RequeueForRetry(name)
     end
     Engine.skipped = {}
-    Engine.nextPassAt = GetTime() + MakeIdiotsAppearDB.settings.interval
     print(PREFIX .. string.format(
         "Pass complete. Retrying %d player(s) still not in the group in %ds.",
         #stragglers, MakeIdiotsAppearDB.settings.interval))
@@ -1127,7 +1134,6 @@ RunInvitePass = function()
     -- actually resolve, instead of ending the run while invites are still
     -- genuinely outstanding.
     Engine.skipped = {}
-    Engine.nextPassAt = GetTime() + MakeIdiotsAppearDB.settings.interval
     print(PREFIX .. string.format(
         "Pass complete. Waiting on %d still-pending invite(s), next check in %ds.",
         CountPendingInvites(), MakeIdiotsAppearDB.settings.interval))
@@ -1209,11 +1215,17 @@ local function StartInvites(list)
     Engine.starting = false
     Engine.startTimer = nil
     SafeRunInvitePass()
+    -- The ticker's own fixed schedule is the single source of truth for
+    -- nextPassAt (see the comment at the end of RunInvitePass) - set once
+    -- here, then re-set every time the ticker actually fires below, never
+    -- touched by RunInvitePass itself.
+    Engine.nextPassAt = GetTime() + settings.interval
     -- Each interval tick starts a fresh round: whatever bounced, expired, or
     -- was otherwise held back during the previous round (see RequeueForRetry
     -- and the end-of-pass straggler merge) becomes this round's queue, and
     -- gets exactly one attempt before anything unresolved is held again.
     Engine.ticker = C_Timer.NewTicker(settings.interval, function()
+      Engine.nextPassAt = GetTime() + settings.interval
       Engine.queue = Engine.nextQueue
       Engine.nextQueue = {}
       SafeRunInvitePass()
