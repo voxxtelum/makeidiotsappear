@@ -605,6 +605,7 @@ ns.GetClassColor = GetClassColor
 
 local Engine = {
   queue = {},          -- names left to invite in the current pass
+  nextQueue = {},      -- names bounced/expired/still-missing this pass, held back for the next scheduled interval
   fullRoster = {},     -- the complete set of names this invite run is trying to get grouped
   running = false,
   starting = false,
@@ -758,6 +759,31 @@ local function ConvertPartyToRaid()
     C_PartyInfo.ConvertToRaid()
   elseif ConvertToRaid then
     ConvertToRaid()
+  end
+end
+
+-- Same namespaced-vs-global fallback as ConvertPartyToRaid above - newer
+-- clients moved loot-method access under C_PartyInfo too.
+local function DoGetLootMethod()
+  if C_PartyInfo and C_PartyInfo.GetLootMethod then
+    return C_PartyInfo.GetLootMethod()
+  end
+  return GetLootMethod()
+end
+
+local function DoSetLootMethod(method, index)
+  if C_PartyInfo and C_PartyInfo.SetLootMethod then
+    C_PartyInfo.SetLootMethod(method, index)
+  else
+    SetLootMethod(method, index)
+  end
+end
+
+local function DoLeaveParty()
+  if C_PartyInfo and C_PartyInfo.LeaveParty then
+    C_PartyInfo.LeaveParty()
+  else
+    LeaveParty()
   end
 end
 
@@ -937,6 +963,11 @@ local MaybeAutoPromoteAssist
 -- only defined later alongside TakePendingInvite.
 local PruneExpiredPendingInvites
 
+-- Forward-declared so RunInvitePass's end-of-pass straggler merge (defined
+-- above the real body of this function) can call it too, not just the
+-- CHAT_MSG_SYSTEM bounce handlers further down.
+local RequeueForRetry
+
 -- Invites everyone currently queued, right now, back to back - no waiting
 -- between individual invites (up to whatever the group can currently hold -
 -- see the capacity check at the top of the loop below). Called once
@@ -1063,7 +1094,11 @@ RunInvitePass = function()
   if everyoneJoined then
     StopInvites("Invite list complete - everyone is in the group.")
   elseif #stragglers > 0 then
-    Engine.queue = stragglers
+    -- Held for the next scheduled round, not invited now - see
+    -- RequeueForRetry and the ticker's queue swap in StartInvites.
+    for _, name in ipairs(stragglers) do
+      RequeueForRetry(name)
+    end
     Engine.skipped = {}
     Engine.nextPassAt = GetTime() + MakeIdiotsAppearDB.settings.interval
     print(PREFIX .. string.format(
@@ -1076,7 +1111,6 @@ RunInvitePass = function()
     -- ticker) so the next scheduled pass can prune and retry once those
     -- actually resolve, instead of ending the run while invites are still
     -- genuinely outstanding.
-    Engine.queue = {}
     Engine.skipped = {}
     Engine.nextPassAt = GetTime() + MakeIdiotsAppearDB.settings.interval
     print(PREFIX .. string.format(
@@ -1100,12 +1134,22 @@ end
 ns.SafeRunInvitePass = SafeRunInvitePass
 
 local function StartInvites(list)
+  -- Converting a party to a raid only works for the party/raid leader -
+  -- discovering that mid-run (after the party's already full) wastes
+  -- several seconds of retries and ends in a confusing message, so check up
+  -- front instead, before anything else starts.
+  if IsInGroup() and not UnitIsGroupLeader("player") then
+    print(PREFIX .. "You can only start invites when you're alone or the group/raid leader.")
+    return
+  end
+
   if #list == 0 then
     print(PREFIX .. "Nothing to invite - the list is empty.")
     return
   end
 
   Engine.queue = {}
+  Engine.nextQueue = {}
   Engine.fullRoster = {}
   for _, n in ipairs(list) do
     table.insert(Engine.queue, n)
@@ -1142,7 +1186,15 @@ local function StartInvites(list)
     Engine.starting = false
     Engine.startTimer = nil
     SafeRunInvitePass()
-    Engine.ticker = C_Timer.NewTicker(settings.interval, SafeRunInvitePass)
+    -- Each interval tick starts a fresh round: whatever bounced, expired, or
+    -- was otherwise held back during the previous round (see RequeueForRetry
+    -- and the end-of-pass straggler merge) becomes this round's queue, and
+    -- gets exactly one attempt before anything unresolved is held again.
+    Engine.ticker = C_Timer.NewTicker(settings.interval, function()
+      Engine.queue = Engine.nextQueue
+      Engine.nextQueue = {}
+      SafeRunInvitePass()
+    end)
     FireStateChanged()
   end
 
@@ -1200,17 +1252,19 @@ local function ClearPendingInvite(key)
 end
 
 -- Lets someone who resolves as "not joined" (declined, bounced, or timed
--- out) become eligible for the very next scheduled pass instead of waiting
--- out an extra full interval before RunInvitePass's own end-of-pass
--- recompute would otherwise notice them.
-local function RequeueForRetry(fullName)
+-- out) become eligible for the next scheduled round - but not before then:
+-- goes into nextQueue rather than the live queue, so they get exactly one
+-- fresh attempt per interval instead of possibly being swept up again by
+-- an in-flight capacity retry a few seconds later (a decliner, or someone
+-- still trying to leave another group, shouldn't be re-invited that fast).
+RequeueForRetry = function(fullName)
   if not Engine.running then return end
-  for _, queued in ipairs(Engine.queue) do
+  for _, queued in ipairs(Engine.nextQueue) do
     if queued:lower() == fullName:lower() then
       return
     end
   end
-  table.insert(Engine.queue, fullName)
+  table.insert(Engine.nextQueue, fullName)
 end
 
 -- Multiple invites can be outstanding at once now, so a system message has to
@@ -1270,6 +1324,25 @@ local function PrunePendingInvites(groupSet)
   end
 end
 
+-- Someone else (an assist manually inviting a roster member, say) can get a
+-- queued name into the group without us ever sending or seeing an invite
+-- for them - we'd have no way to know, since a system message about that
+-- invite only ever shows to whoever sent it. GROUP_ROSTER_UPDATE is the one
+-- reliable signal we do get, so drop the name from both queues the instant
+-- they actually show up in the roster, regardless of who invited them.
+local function PruneJoinedFromQueues(groupSet)
+  for i = #Engine.queue, 1, -1 do
+    if LookupByFullOrName(groupSet, Engine.queue[i]) then
+      table.remove(Engine.queue, i)
+    end
+  end
+  for i = #Engine.nextQueue, 1, -1 do
+    if LookupByFullOrName(groupSet, Engine.nextQueue[i]) then
+      table.remove(Engine.nextQueue, i)
+    end
+  end
+end
+
 -- Backstop for invites that never resolve at all (no accept, no decline,
 -- nothing) - once the server's own ~60s invite window has passed, the
 -- reserved party slot is gone regardless of what we do, so stop counting it
@@ -1286,6 +1359,20 @@ PruneExpiredPendingInvites = function()
       end
     end
   end
+end
+
+-- Converts as soon as it's actually possible (2+ confirmed members) rather
+-- than waiting until the party is nearly full - by the time RunInvitePass's
+-- own capacity check would otherwise trigger a conversion, the group has
+-- almost always already converted here. Only fires while a run is active
+-- and only for the leader, same restriction ConvertPartyToRaid itself is
+-- subject to - see StartInvites' upfront leadership check.
+local function MaybeConvertToRaid()
+  if not Engine.running then return end
+  if IsInRaid() then return end
+  if not UnitIsGroupLeader("player") then return end
+  if GetNumGroupMembers() < 2 then return end
+  ConvertPartyToRaid()
 end
 
 ----------------------------------------------------------------------
@@ -1317,12 +1404,12 @@ local function MaybeSetMasterLoot()
   if not IsInRaid() then return end
   if GetNumGroupMembers() <= MASTER_LOOT_MIN_GROUP_SIZE then return end
   if not UnitIsGroupLeader("player") then return end
-  if GetLootMethod() == "master" then return end
+  if DoGetLootMethod() == "master" then return end
 
   local playerIndex = GetPlayerRaidIndex()
   if not playerIndex then return end
 
-  SetLootMethod("master", playerIndex)
+  DoSetLootMethod("master", playerIndex)
 end
 
 ----------------------------------------------------------------------
@@ -1339,7 +1426,7 @@ local function MaybeSetLootThreshold()
   if Engine.masterLooterPromoted then return end
   if not IsInRaid() then return end
   if not UnitIsGroupLeader("player") then return end
-  if GetLootMethod() ~= "master" then return end
+  if DoGetLootMethod() ~= "master" then return end
   if GetLootThreshold() == settings.lootThresholdQuality then return end
 
   -- Poor/Common (0/1) aren't thresholds Blizzard's own raid UI offers and
@@ -1380,7 +1467,7 @@ local function MaybeSetMasterLooter()
   if Engine.masterLooterPromoted then return end
   if not IsInRaid() then return end
   if not UnitIsGroupLeader("player") then return end
-  if GetLootMethod() ~= "master" then return end
+  if DoGetLootMethod() ~= "master" then return end
 
   local groupSet = GetGroupNameSet()
   for candidateName in (settings.masterLooterNames or ""):gmatch("%S+") do
@@ -1388,7 +1475,7 @@ local function MaybeSetMasterLooter()
     if matchedFullName then
       local raidIndex = FindRaidIndexForFullName(matchedFullName)
       if raidIndex then
-        SetLootMethod("master", raidIndex)
+        DoSetLootMethod("master", raidIndex)
         Engine.masterLooterPromoted = true
       end
       return
@@ -1459,7 +1546,7 @@ local function DisbandGroup()
     end
   end
 
-  LeaveParty()
+  DoLeaveParty()
 end
 ns.DisbandGroup = DisbandGroup
 
@@ -1485,9 +1572,12 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
       Engine.masterLooterPromoted = false
     end
     ScanGroupRoster()
-    PrunePendingInvites(GetGroupNameSet())
+    local groupSet = GetGroupNameSet()
+    PrunePendingInvites(groupSet)
+    PruneJoinedFromQueues(groupSet)
     CheckNewlyJoinedDurability()
     ns.OnGroupRosterUpdateForApplyEngine()
+    MaybeConvertToRaid()
     MaybeSetMasterLoot()
     MaybeSetLootThreshold()
     MaybeSetMasterLooter()

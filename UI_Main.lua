@@ -563,7 +563,10 @@ local function RefreshEngineStatus()
     mode = "running"
     values = {
       pending = ns.CountPendingInvites(),
-      queued = #Engine.queue,
+      -- Includes nextQueue (names held back for the next scheduled round,
+      -- e.g. bounced/declined/expired) so this doesn't misleadingly drop to
+      -- 0 mid-interval once the current round's queue has drained.
+      queued = #Engine.queue + #Engine.nextQueue,
       skipped = #Engine.skipped,
     }
     buttonText = "Stop Invites"
