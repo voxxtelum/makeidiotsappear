@@ -1261,12 +1261,17 @@ local function ClearPendingInvite(key)
   Engine.pendingInviteSentAt[key] = nil
 end
 
--- Lets someone who resolves as "not joined" (declined, bounced, or timed
--- out) become eligible for the next scheduled round - but not before then:
--- goes into nextQueue rather than the live queue, so they get exactly one
--- fresh attempt per interval instead of possibly being swept up again by
--- an in-flight capacity retry a few seconds later (a decliner, or someone
--- still trying to leave another group, shouldn't be re-invited that fast).
+-- Lets someone who resolves as "not joined" (declined or bounced - a real
+-- response from the game, not silence) become eligible for the next
+-- scheduled round - but not before then: goes into nextQueue rather than
+-- the live queue, so they get exactly one fresh attempt per interval
+-- instead of possibly being swept up again by an in-flight capacity retry
+-- a few seconds later (a decliner, or someone still trying to leave another
+-- group, shouldn't be re-invited that fast). A silent timeout is handled
+-- separately, immediately, by RequeueForImmediateRetry below - there's no
+-- "give them a moment" consideration for someone who never responded at
+-- all, and the 61s wait before we even get here already covers the "don't
+-- retry too early" concern this function exists for.
 RequeueForRetry = function(fullName)
   if not Engine.running then return end
   for _, queued in ipairs(Engine.nextQueue) do
@@ -1275,6 +1280,21 @@ RequeueForRetry = function(fullName)
     end
   end
   table.insert(Engine.nextQueue, fullName)
+end
+
+-- Used only by PruneExpiredPendingInvites, which runs at the very top of
+-- RunInvitePass before the while-loop starts draining Engine.queue - so
+-- pushing here (rather than into nextQueue like RequeueForRetry) means a
+-- just-expired invite gets retried in this same pass, not held an entire
+-- extra interval on top of the 61s it already waited.
+local function RequeueForImmediateRetry(fullName)
+  if not Engine.running then return end
+  for _, queued in ipairs(Engine.queue) do
+    if queued:lower() == fullName:lower() then
+      return
+    end
+  end
+  table.insert(Engine.queue, fullName)
 end
 
 -- Multiple invites can be outstanding at once now, so a system message has to
@@ -1356,8 +1376,9 @@ end
 -- Backstop for invites that never resolve at all (no accept, no decline,
 -- nothing) - once the server's own ~60s invite window has passed, the
 -- reserved party slot is gone regardless of what we do, so stop counting it
--- against the cap and make the person eligible for another invite attempt
--- (see ComputeStragglers).
+-- against the cap and make the person eligible for another invite attempt,
+-- right away rather than waiting an extra interval (see
+-- RequeueForImmediateRetry above).
 PruneExpiredPendingInvites = function()
   local now = GetTime()
   for key, sentAt in pairs(Engine.pendingInviteSentAt) do
@@ -1365,7 +1386,7 @@ PruneExpiredPendingInvites = function()
       local fullName = Engine.pendingInvites[key]
       ClearPendingInvite(key)
       if fullName then
-        RequeueForRetry(fullName)
+        RequeueForImmediateRetry(fullName)
       end
     end
   end
