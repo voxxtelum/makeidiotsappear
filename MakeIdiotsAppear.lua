@@ -113,6 +113,32 @@ local function ApplyTooltipWindowStyle(aceFrame)
 end
 ns.ApplyTooltipWindowStyle = ApplyTooltipWindowStyle
 
+-- Closes an AceGUI Frame on Escape, opt-in per window (not applied to the
+-- main window) - AceGUI's Frame widget creates its underlying frame with no
+-- global name (see AceGUIContainer-Frame.lua's Constructor), so the usual
+-- UISpecialFrames trick doesn't apply without patching that vendored
+-- library. EnableKeyboard broadcasts OnKeyDown to every keyboard-enabled
+-- frame regardless of what actually has focus (that's what lets this work
+-- even while some nested EditBox owns real keyboard focus) -
+-- SetPropagateKeyboardInput(true) is the default so every other key still
+-- passes through untouched; only an actual ESCAPE press flips it off for
+-- that one keypress so it doesn't also fall through to the default Game
+-- Menu. aceFrame:Hide() (not frame:Hide()) so this always goes through the
+-- same OnClose callback each window already wires up to its own Close
+-- button, rather than being a second, separately-maintained close path.
+local function CloseWindowOnEscape(aceFrame)
+  local frame = aceFrame.frame
+  frame:EnableKeyboard(true)
+  frame:SetPropagateKeyboardInput(true)
+  frame:HookScript("OnKeyDown", function(self, key)
+    if key == "ESCAPE" then
+      self:SetPropagateKeyboardInput(false)
+      aceFrame:Hide()
+    end
+  end)
+end
+ns.CloseWindowOnEscape = CloseWindowOnEscape
+
 -- AceGUI's Button widget exposes its text FontString directly as .text;
 -- shrink it relative to whatever size/font it already has rather than
 -- hardcoding a new one.
