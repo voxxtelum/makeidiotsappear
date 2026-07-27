@@ -242,11 +242,21 @@ local function AddBorderedBackground(f, r, g, b, a)
 end
 ns.AddBorderedBackground = AddBorderedBackground
 
--- Class color, always - no longer conditional on raid/party membership (see
--- MissingIndicatorWidth/UpdateMissingIndicator below for how "not currently
--- in your raid/party" is shown instead). Plain white if we don't know their
--- class (shouldn't normally happen for anyone actually placed in a slot).
-local function ComputeNameColor(name, classMap)
+-- Same grey UI_Main.lua's player list uses for its "Offline" status (see
+-- STATUS_COLORS there) - reused here so "not currently in your raid/party"
+-- reads the same grey everywhere in the addon.
+local MISSING_NAME_R, MISSING_NAME_G, MISSING_NAME_B = 0.6, 0.6, 0.6
+
+-- Class color, unless the player isn't currently in your raid/party (per
+-- groupSet - same check UpdateMissingIndicator below uses for the red bar),
+-- in which case grey instead - groupSet is nil-safe (omit it to always get
+-- class color, e.g. anywhere a missing-indicator check doesn't apply).
+-- Plain white if we don't know their class (shouldn't normally happen for
+-- anyone actually placed in a slot).
+local function ComputeNameColor(name, classMap, groupSet)
+  if groupSet and name and not ns.LookupByFullOrName(groupSet, name) then
+    return MISSING_NAME_R, MISSING_NAME_G, MISSING_NAME_B
+  end
   local classFile = ns.LookupByFullOrName(classMap, name)
   local r, g, b = ns.GetClassColor(classFile)
   if r then
@@ -258,7 +268,10 @@ end
 -- Thin red bar on the left edge, shown only when the named player is not
 -- currently a member of your raid/party (checked via groupSet - see
 -- MakeIdiotsAppear.lua's GetGroupNameSet) - hidden for everyone actually in
--- the group, and for empty slots.
+-- the group, for empty slots, and always for yourself (DoRefreshGroupsWindow
+-- forces your own name into groupSet before this ever runs, since you're
+-- inherently "online" to your own client whether or not you've actually
+-- joined a raid/party yet).
 local MISSING_INDICATOR_WIDTH = 2
 
 local function AddMissingIndicator(f)
@@ -557,7 +570,7 @@ end
 local function SetTokenDisplay(frame, name, classMap, groupSet, benchSet, rlFullName)
   frame.text:SetText(name or "")
   if name then
-    frame.text:SetTextColor(ComputeNameColor(name, classMap))
+    frame.text:SetTextColor(ComputeNameColor(name, classMap, groupSet))
   end
   UpdateMissingIndicator(frame, name, groupSet)
   UpdateBenchMarker(frame, name, benchSet)
@@ -578,7 +591,7 @@ local function SetSlotEditBoxDisplay(slot, name, classMap, groupSet, benchSet, r
   slot:SetText(name or "")
   slot.textAtFocus = name or ""
   if name then
-    slot:SetFontObject(GetColoredFont(ComputeNameColor(name, classMap)))
+    slot:SetFontObject(GetColoredFont(ComputeNameColor(name, classMap, groupSet)))
   else
     slot:SetFontObject(SlotBaseFont)
   end
@@ -800,6 +813,17 @@ local function DoRefreshGroupsWindow()
   local comp, data = GetComp()
   local classMap = ns.GetClassMap()
   local groupSet = ns.GetGroupNameSet()
+  -- Always treat ourselves as present in this window's missing-indicator
+  -- check (see UpdateMissingIndicator), regardless of whether we're actually
+  -- in a raid/party right now - we're the one looking at this UI, so we're
+  -- inherently online, e.g. even while solo planning group comps ahead of an
+  -- invite. GetGroupNameSet() returns a fresh table each call, so mutating
+  -- this local copy doesn't affect any other consumer of that function
+  -- (invite-loop straggler/completion checks etc. still see the real state).
+  local ownFullName = ns.GetFullUnitName("player")
+  if ownFullName then
+    groupSet[ownFullName:lower()] = ownFullName
+  end
   local rlFullName = ns.FindRaidLeader()
 
   -- Bench = roster entries past the roster's own group size (see
