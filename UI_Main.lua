@@ -391,12 +391,18 @@ local function CreateBenchRow(fullName, status, classMap)
   -- it whenever this recycled row frame gets released - it isn't reachable
   -- through AceGUI's own ReleaseChildren since it was never added via
   -- :AddChild.
-  local inviteBtn = CreateIconButton(row.frame, "Plus", function()
-    ns.InvitePlayerManually(fullName)
-  end)
-  RaiseAboveParent(inviteBtn, row.frame)
-  inviteBtn:SetPoint("RIGHT", row.frame, "RIGHT", -4, 0)
-  row.frame.riInviteBtn = inviteBtn
+  --
+  -- Skipped entirely once they're already "In Group" - you can't invite
+  -- someone who's already in your raid/party, so the button would just be a
+  -- no-op (or worse, a confusing "already in group" bounce message).
+  if status ~= "In Group" then
+    local inviteBtn = CreateIconButton(row.frame, "Plus", function()
+      ns.InvitePlayerManually(fullName)
+    end)
+    RaiseAboveParent(inviteBtn, row.frame)
+    inviteBtn:SetPoint("RIGHT", row.frame, "RIGHT", -4, 0)
+    row.frame.riInviteBtn = inviteBtn
+  end
 
   row:AddChild(nameLabel)
   row:AddChild(statusLabel)

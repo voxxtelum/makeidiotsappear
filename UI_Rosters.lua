@@ -26,6 +26,15 @@ local rosterScroll, nameBox, playersBox
 local SaveRoster
 local SetActiveRoster
 
+-- Name of a roster just created via "Add Roster" that hasn't been saved yet
+-- - set there, consumed (cleared) the first time SaveRoster actually
+-- succeeds for it, so that first save also activates it (see SaveRoster
+-- below). Cleared early (without activating) if the user navigates away to
+-- another roster first - see the roster row OnClick/OnDoubleClick handlers
+-- and ns.DeleteRoster below - so an unrelated later save can never
+-- retroactively activate a roster the user never actually finished creating.
+local pendingNewRosterName = nil
+
 -- Fixed raid-size choices a roster can be tagged with; picking one saves
 -- immediately (see the checkboxes built in BuildRosterManagerFrame below).
 local GROUP_SIZES = { 10, 20, 40 }
@@ -173,6 +182,9 @@ local function RefreshRosterList()
       end
 
       row.riButton:SetScript("OnClick", function()
+        if name ~= pendingNewRosterName then
+          pendingNewRosterName = nil
+        end
         selectedRoster = name
         nameBox:SetText(name)
         playersBox:SetText(table.concat(MakeIdiotsAppearDB.rosters[name] or {}, "\n"))
@@ -181,6 +193,9 @@ local function RefreshRosterList()
       end)
 
       row.riButton:SetScript("OnDoubleClick", function()
+        if name ~= pendingNewRosterName then
+          pendingNewRosterName = nil
+        end
         selectedRoster = name
         nameBox:SetText(name)
         playersBox:SetText(table.concat(MakeIdiotsAppearDB.rosters[name] or {}, "\n"))
@@ -222,6 +237,9 @@ function ns.DeleteRoster(name)
   if MakeIdiotsAppearDB.settings.activeRoster == name then
     MakeIdiotsAppearDB.settings.activeRoster = nil
   end
+  if pendingNewRosterName == name then
+    pendingNewRosterName = nil
+  end
   if selectedRoster == name then
     selectedRoster = nil
     nameBox:SetText("")
@@ -260,6 +278,9 @@ local function BuildRosterManagerFrame()
     AceGUI:Release(widget)
     rosterManagerFrame = nil
     selectedRoster = nil
+    -- Closing mid-creation (added but never saved) shouldn't let some
+    -- unrelated later save of a same-named roster auto-activate it.
+    pendingNewRosterName = nil
   end)
 
   ----------------------------------------------------------------
@@ -316,12 +337,12 @@ local function BuildRosterManagerFrame()
   addRosterBtn:SetCallback("OnClick", function()
     local name = GenerateUniqueRosterName()
     MakeIdiotsAppearDB.rosters[name] = {}
+    pendingNewRosterName = name
     selectedRoster = name
     nameBox:SetText(name)
     playersBox:SetText("")
     RefreshRosterList()
     RefreshGroupSizeSelection()
-    print(PREFIX .. "Created blank roster '" .. name .. "'.")
 
     -- Send focus straight to the name box with the placeholder name
     -- pre-highlighted, so typing immediately replaces it and Enter saves -
@@ -458,6 +479,15 @@ local function BuildRosterManagerFrame()
       return
     end
 
+    -- Captured before any rename below can change selectedRoster - true only
+    -- for the first successful save of a roster created via "Add Roster"
+    -- (see pendingNewRosterName's own comment), so that save also activates
+    -- it. Left un-consumed on every early-return above/below so a failed
+    -- attempt (blank name, name collision) doesn't lose the intent - the
+    -- user's very next successful save of this same roster still activates
+    -- it.
+    local isPendingNewRoster = (selectedRoster == pendingNewRosterName)
+
     local newName = ns.Trim(nameBox:GetText())
     if newName == "" then
       print(PREFIX .. "Enter a name for the roster.")
@@ -477,7 +507,6 @@ local function BuildRosterManagerFrame()
       if MakeIdiotsAppearDB.settings.activeRoster == selectedRoster then
         MakeIdiotsAppearDB.settings.activeRoster = newName
       end
-      print(PREFIX .. "Renamed roster '" .. selectedRoster .. "' to '" .. newName .. "'.")
       selectedRoster = newName
     end
 
@@ -494,8 +523,14 @@ local function BuildRosterManagerFrame()
     if #needsRealm > 0 then
       print(PREFIX .. "These entries still need a realm (no match found yet): " .. table.concat(needsRealm, ", "))
     end
-    RefreshRosterList()
-    ns.FireStateChanged()
+
+    if isPendingNewRoster then
+      pendingNewRosterName = nil
+      SetActiveRoster(selectedRoster)
+    else
+      RefreshRosterList()
+      ns.FireStateChanged()
+    end
   end
 
   local saveBtn = AceGUI:Create("Button")
