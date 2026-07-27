@@ -537,6 +537,29 @@ local function GetGuildOnlineMap()
 end
 ns.GetGuildOnlineMap = GetGuildOnlineMap
 
+-- Companion to GetGuildOnlineMap above, same scan but only for currently-online
+-- members and mapping to their properly-cased full name instead of a plain
+-- boolean - used by MaybeInviteNewlyOnline below, which needs an actual name to
+-- match against the queues and invite, not just an online/offline flag.
+local function GetOnlineGuildMembersMap()
+  local map = {}
+  if IsInGuild() then
+    local getNum = (C_GuildInfo and C_GuildInfo.GetNumGuildMembers) or GetNumGuildMembers
+    local getInfo = (C_GuildInfo and C_GuildInfo.GetGuildRosterInfo) or GetGuildRosterInfo
+    local numTotal = getNum and getNum() or 0
+    if getInfo then
+      for i = 1, numTotal do
+        local fullName, _, _, _, _, _, _, _, isOnline = getInfo(i)
+        local full = fullName and ResolveFullName(fullName)
+        if full and isOnline then
+          map[full:lower()] = full
+        end
+      end
+    end
+  end
+  return map
+end
+
 -- Class is only knowable for players we can currently see - our group, or
 -- our guild roster. Group data wins when both are available since it's live.
 -- Keyed by full "name-realm", same as GetGroupNameSet/GetGuildOnlineMap.
@@ -1373,6 +1396,35 @@ local function PruneJoinedFromQueues(groupSet)
   end
 end
 
+-- Finds and removes the entry in this queue matching a full "Name-Realm" that
+-- just came online, used by MaybeInviteNewlyOnline below. Handles both an
+-- already-resolved exact match and a not-yet-realm-resolved bare-name entry -
+-- but mirrors TakePendingInvite's "don't guess if ambiguous" caution: if more
+-- than one entry in this queue shares that bare name, we can't tell which one
+-- is actually the player who just logged on, so leave both alone rather than
+-- risk moving the wrong one to the front.
+local function TakeMatchingQueueEntry(queue, fullOnlineName)
+  local fullKey = fullOnlineName:lower()
+  local shortKey = NamePart(fullOnlineName)
+  local exactIndex
+  local shortIndex
+  local shortMatches = 0
+  for i, queued in ipairs(queue) do
+    if queued:lower() == fullKey then
+      exactIndex = i
+      break
+    elseif NamePart(queued) == shortKey then
+      shortIndex = i
+      shortMatches = shortMatches + 1
+    end
+  end
+  local index = exactIndex or (shortMatches == 1 and shortIndex or nil)
+  if index then
+    return table.remove(queue, index)
+  end
+  return nil
+end
+
 -- Backstop for invites that never resolve at all (no accept, no decline,
 -- nothing) - once the server's own ~60s invite window has passed, the
 -- reserved party slot is gone regardless of what we do, so stop counting it
@@ -1405,6 +1457,45 @@ MaybeConvertToRaid = function()
   if not UnitIsGroupLeader("player") then return end
   if GetNumGroupMembers() < 2 then return end
   ConvertPartyToRaid()
+end
+
+----------------------------------------------------------------------
+-- Jump the queue for guild members who just came online
+----------------------------------------------------------------------
+
+-- key -> full "Name-Realm", as of the last time this ran. Deliberately a
+-- plain persistent local, not reset by StartInvites - it needs to already
+-- reflect who was online *before* a run starts, so a player who was already
+-- online when Start Invites was clicked doesn't look like a fresh "just
+-- came online" transition the first time this runs during that run.
+local lastOnlineGuildMembers = {}
+
+-- Guild online notifications ("has come online") are a client-side toast
+-- gated behind a per-user setting most players don't have on, so an addon
+-- can't reliably hook a system message for this the way it does for invite
+-- bounces - RaidInviteClassic doesn't either, it diffs guild roster online
+-- state the same way this does. Called every GUILD_ROSTER_UPDATE; only
+-- actually moves anyone if a run is active, but always updates the snapshot
+-- so the diff stays accurate for whenever the next run does start.
+local function MaybeInviteNewlyOnline()
+  local nowOnline = GetOnlineGuildMembersMap()
+  if Engine.running then
+    local movedAny = false
+    for key, fullName in pairs(nowOnline) do
+      if not lastOnlineGuildMembers[key] then
+        local moved = TakeMatchingQueueEntry(Engine.queue, fullName)
+            or TakeMatchingQueueEntry(Engine.nextQueue, fullName)
+        if moved then
+          table.insert(Engine.queue, 1, moved)
+          movedAny = true
+        end
+      end
+    end
+    if movedAny then
+      SafeRunInvitePass()
+    end
+  end
+  lastOnlineGuildMembers = nowOnline
 end
 
 ----------------------------------------------------------------------
@@ -1653,6 +1744,7 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
   end
 
   if event == "GUILD_ROSTER_UPDATE" then
+    MaybeInviteNewlyOnline()
     FireStateChanged()
     return
   end
