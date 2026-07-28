@@ -1,12 +1,39 @@
 -- UI_PlayerDB.lua
 -- Player Database window: view/add/remove/edit every learned Name-Realm-Class
--- entry from MakeIdiotsAppearDB.masterRoster as a sortable grid. Built with
+-- entry from MakeIdiotsAppearDB.masterRoster as a filterable grid. Built with
 -- AceGUI-3.0. Opened only via "/mia playerdb" (see UI_Main.lua's slash
 -- handler) - not linked from any other window yet.
+--
+-- Each row is either display mode (plain, class-colored text + an Edit
+-- button) or edit mode (EditBoxes + a class Dropdown + a Save button) - see
+-- CreateRow. Saving a row commits it straight to MakeIdiotsAppearDB
+-- immediately (via ns.UpsertPlayerDbEntry); there's no separate "staged
+-- changes" state or bulk Save button - a row not currently being edited is
+-- always already what's in the database.
 
 local ADDON_NAME, ns = ...
 local PREFIX = ns.PREFIX
 local AceGUI = LibStub("AceGUI-3.0")
+
+-- Forward-declared so the popup below (registered once, at file load time,
+-- long before DoRemoveRow's own definition further down) closes over this
+-- same upvalue rather than resolving DoRemoveRow as an undeclared global.
+local DoRemoveRow
+
+StaticPopupDialogs["MAKEIDIOTSAPPEAR_CONFIRM_REMOVE_PLAYER"] = {
+  text = "Remove '%s' from the player database? This cannot be undone.",
+  button1 = "Remove",
+  button2 = "Cancel",
+  OnAccept = function(self, data)
+    if data and data.row then
+      DoRemoveRow(data.row)
+    end
+  end,
+  timeout = 0,
+  whileDead = true,
+  hideOnEscape = true,
+  preferredIndex = 3,
+}
 
 -- Built once - the running client's class set never changes mid-session.
 -- "" / "(Unknown)" is prepended so a row can represent "class not yet known"
@@ -21,48 +48,110 @@ do
   end
 end
 
-local ROW_RELWIDTHS = { name = 0.28, realm = 0.28, class = 0.24, remove = 0.14 }
+-- "action" is the Edit/Save toggle button. There's no separate column for
+-- the remove button - it's a plain native icon (see CreateRemoveButton
+-- below), positioned absolutely at the row's right edge rather than taking
+-- its own Flow slot, the same technique UI_Main.lua uses for its own bench
+-- row's "+" invite button. Deliberately left summing under 1.0 (see e.g.
+-- UI_Rosters.lua's leftGroup for why: AceGUI's Flow layout can wrap a child
+-- to a new row if pixel rounding pushes the combined width a hair over) -
+-- the remaining ~10% at the right edge is exactly where that icon sits.
+local ROW_RELWIDTHS = { name = 0.28, realm = 0.28, class = 0.24, action = 0.10 }
+
+-- Fixed row height, same in display and edit mode, sized to fit an
+-- unlabeled EditBox/Dropdown (both default to 26px tall with no label - see
+-- their own SetLabel methods) without clipping. Both modes use this same
+-- value for every widget in the row (see CreateRow) specifically so toggling
+-- a row between modes never changes its height - which would otherwise
+-- shift every row below it up or down in the list.
+local ROW_HEIGHT = 26
+
+-- Plain native icon button (no AceGUI widget), same technique as
+-- UI_Main.lua's own CreateIconButton (used there for the collapse/expand
+-- buttons and the bench row's invite button) - AceGUI's own Button widget
+-- is built on UIPanelButtonTemplate, whose text inset leaves no room for
+-- anything at this size. UI-GroupLoot-Pass is the group-loot roll frame's
+-- "Pass" (decline) button - a plain red X, the closest native WoW asset to
+-- a generic small delete icon. The highlight reuses the same -Up texture
+-- (additive blend, so hovering just brightens it) rather than a separate
+-- -Highlight variant, matching CreateIconButton's own reasoning for doing
+-- the same.
+local REMOVE_ICON_SIZE = 16
+
+local function CreateRemoveButton(parent, onClick)
+  local btn = CreateFrame("Button", nil, parent)
+  btn:SetSize(REMOVE_ICON_SIZE, REMOVE_ICON_SIZE)
+  btn:SetNormalTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Up")
+  btn:SetPushedTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Down")
+  btn:SetHighlightTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Up", "ADD")
+  btn:SetScript("OnClick", onClick)
+  return btn
+end
 
 local playerDbFrame = nil
 local scroll = nil
-local nameHeader, realmHeader, classHeader
 
--- Edits are staged here, not written to MakeIdiotsAppearDB until "Save
--- Changes" is clicked - closing the window without saving just discards
--- this. Each row is {name=, realm=, class=classFileOrNil, origName=,
--- origRealm=}; origName/origRealm are nil for a row added via "Add Player"
--- this session, and otherwise record what the entry looked like when this
--- window was (re)opened, so Save can tell a rename from a fresh add and
--- remove the old key it superseded (see the Save button below).
+-- Every row currently shown, in DB order. Each row is:
+--   { name=, realm=, class=classFileOrNil, editing=bool,
+--     saved = {name=, realm=, class=} or nil }
+-- `saved` is nil for a row added via "Add Player" that's never been
+-- committed yet; otherwise it's that row's last-known database identity,
+-- used to know what to remove-and-replace on a rename, what to revert to if
+-- an edit is abandoned, and what to delete on Remove.
 local workingRows = {}
 
--- {name=, realm=} pairs explicitly removed via a row's Remove button this
--- session, applied on Save. A brand-new (never-saved) row removed this way
--- just disappears from workingRows with nothing queued here.
-local pendingRemovals = {}
+-- The one row currently in edit mode, or nil - only one row can be edited
+-- at a time (see StartEditingRow).
+local editingRow = nil
 
-local sortColumn = "name"
-local sortAscending = true
+-- Current text of the search box and whether it was actually filtering
+-- (3+ characters) the last time the grid was rendered - see the search
+-- box's OnTextChanged callback (in BuildPlayerDbFrame) for why
+-- wasFiltering matters, and RenderRows for where it's kept up to date.
+local searchText = ""
+local wasFiltering = false
 
 local RenderRows
 
 local function LoadWorkingRows()
   workingRows = {}
+  editingRow = nil
   for _, entry in ipairs(ns.GetAllPlayerDbEntries()) do
     table.insert(workingRows, {
       name = entry.name,
       realm = entry.realm,
       class = entry.class,
-      origName = entry.name,
-      origRealm = entry.realm,
+      editing = false,
+      saved = { name = entry.name, realm = entry.realm, class = entry.class },
     })
   end
-  pendingRemovals = {}
+
+  -- ns.GetAllPlayerDbEntries flattens a plain hash table (masterRoster), so
+  -- its order is otherwise arbitrary - sort by name (realm as a tiebreaker,
+  -- for two entries sharing a name on different realms) so the list has a
+  -- stable, predictable default order. Only applied here, at load time - a
+  -- row doesn't get re-sorted into place after being edited/saved, and a
+  -- freshly added row is deliberately pinned to the top instead (see the Add
+  -- Player button).
+  table.sort(workingRows, function(a, b)
+    local an, bn = a.name:lower(), b.name:lower()
+    if an == bn then
+      return (a.realm or ""):lower() < (b.realm or ""):lower()
+    end
+    return an < bn
+  end)
 end
 
-local function RemoveRow(row)
-  if row.origName then
-    table.insert(pendingRemovals, { name = row.origName, realm = row.origRealm })
+-- Removes a row that's already been confirmed (see RemoveRow below) -
+-- deletes its database entry if it had one, drops it from workingRows, and
+-- re-renders.
+DoRemoveRow = function(row)
+  if row.saved then
+    ns.RemovePlayerDbEntry(row.saved.name, row.saved.realm)
+    ns.FireStateChanged()
+  end
+  if editingRow == row then
+    editingRow = nil
   end
   for i, r in ipairs(workingRows) do
     if r == row then
@@ -73,53 +162,152 @@ local function RemoveRow(row)
   RenderRows()
 end
 
+-- Only confirms when there's an actual saved database entry to lose - a
+-- brand-new row that was never saved has nothing destructive to confirm.
+local function RemoveRow(row)
+  if row.saved then
+    StaticPopup_Show("MAKEIDIOTSAPPEAR_CONFIRM_REMOVE_PLAYER", row.saved.name .. "-" .. row.saved.realm, nil, { row = row })
+  else
+    DoRemoveRow(row)
+  end
+end
+
+-- Ends edit mode on a row without saving it - reverts a previously-saved
+-- row's display back to its last-saved values, or (for a brand-new row that
+-- was never saved) just discards it outright, since there'd be nothing left
+-- to meaningfully display. Used both when a row's own edit is abandoned by
+-- starting to edit a different row (see StartEditingRow - only one row can
+-- be in edit mode at a time) and could be reused for an explicit cancel
+-- later if this ever gets one.
+local function AbandonEdit(row)
+  if row.saved then
+    row.name = row.saved.name
+    row.realm = row.saved.realm
+    row.class = row.saved.class
+    row.editing = false
+  else
+    for i, r in ipairs(workingRows) do
+      if r == row then
+        table.remove(workingRows, i)
+        break
+      end
+    end
+  end
+  if editingRow == row then
+    editingRow = nil
+  end
+end
+
+local function StartEditingRow(row)
+  if editingRow and editingRow ~= row then
+    AbandonEdit(editingRow)
+  end
+  editingRow = row
+  row.editing = true
+  RenderRows()
+end
+
+local function SaveRow(row)
+  local rawName = row.name or ""
+  local label = rawName ~= "" and rawName or "(blank)"
+  local name = ns.ProperCase(ns.Trim(rawName))
+  local realmInput = ns.Trim(row.realm or "")
+  local realm = ns.NormalizeRealmName(realmInput)
+
+  if not ns.IsValidPlayerDbName(name) then
+    print(PREFIX .. "Can't save " .. label .. " - invalid name (2-12 letters, no character repeated 3+ times in a row).")
+    return
+  end
+  if not realm then
+    print(PREFIX .. "Can't save " .. label .. " - unrecognized realm '" .. (realmInput ~= "" and realmInput or "(blank)") .. "'.")
+    return
+  end
+
+  -- Only one row can ever be in edit mode at a time (see StartEditingRow),
+  -- so every other row's identity is its own already-saved one - safe to
+  -- check against directly rather than some other row's in-progress text.
+  local lowerKey = name:lower() .. "|" .. realm:lower()
+  for _, other in ipairs(workingRows) do
+    if other ~= row and other.saved then
+      local otherKey = other.saved.name:lower() .. "|" .. other.saved.realm:lower()
+      if otherKey == lowerKey then
+        print(PREFIX .. "Can't save " .. name .. "-" .. realm .. " - a different entry already uses that name and realm.")
+        return
+      end
+    end
+  end
+
+  -- A rename (name or realm changed from what this row was last saved
+  -- with) leaves the old key behind in the database unless it's explicitly
+  -- removed too - upserting only ever adds/updates the new key.
+  if row.saved and (row.saved.name:lower() ~= name:lower() or row.saved.realm:lower() ~= realm:lower()) then
+    ns.RemovePlayerDbEntry(row.saved.name, row.saved.realm)
+  end
+  ns.UpsertPlayerDbEntry(name, realm, row.class or false)
+
+  row.name, row.realm = name, realm
+  row.saved = { name = name, realm = realm, class = row.class }
+  row.editing = false
+  editingRow = nil
+
+  ns.FireStateChanged()
+  print(PREFIX .. "Saved " .. name .. "-" .. realm .. ".")
+  RenderRows()
+end
+
 local function ClassDisplayName(classFile)
   if not classFile then return "" end
   return CLASS_LIST[classFile] or classFile
 end
 
-local function CompareRows(a, b)
-  local av, bv
-  if sortColumn == "class" then
-    av, bv = ClassDisplayName(a.class):lower(), ClassDisplayName(b.class):lower()
-  else
-    av, bv = (a[sortColumn] or ""):lower(), (b[sortColumn] or ""):lower()
-  end
-
-  if av == bv then
-    -- Tiebreaker so rows with equal sort keys don't visibly reshuffle
-    -- between re-renders.
-    return (a.name or ""):lower() < (b.name or ""):lower()
-  end
-  if sortAscending then
-    return av < bv
-  else
-    return av > bv
+local function ApplyClassColor(label, classFile)
+  local r, g, b = ns.GetClassColor(classFile)
+  if r then
+    label:SetColor(r, g, b)
   end
 end
 
-local function UpdateHeaderLabel(header, columnKey, baseText)
-  if sortColumn == columnKey then
-    header:SetText(baseText .. (sortAscending and "  \226\150\178" or "  \226\150\188"))
-  else
-    header:SetText(baseText)
+-- needle is already trimmed/lowercased by the caller. Plain (non-pattern)
+-- find, so a search string containing Lua pattern characters (e.g. "-" in a
+-- realm name) is matched literally instead of erroring or matching oddly.
+local function RowMatchesSearch(row, needle)
+  local name = (row.name or ""):lower()
+  local realm = (row.realm or ""):lower()
+  local class = ClassDisplayName(row.class):lower()
+  return name:find(needle, 1, true) ~= nil
+    or realm:find(needle, 1, true) ~= nil
+    or class:find(needle, 1, true) ~= nil
+end
+
+-- Parents a native remove icon directly onto rowGroup.frame (not added via
+-- :AddChild - see ROW_RELWIDTHS' own comment for why) and wires up cleanup
+-- so it can't leak into some other window's SimpleGroup later. AceGUI
+-- recycles "SimpleGroup" widgets by type across this entire addon (every
+-- row here is a fresh one each render - see RenderRows/CreateRow), and
+-- HookScript-free plain child frames parented this way aren't reachable
+-- through AceGUI's own ReleaseChildren, so without this they'd still be
+-- sitting there the next time this exact recycled frame gets handed out as
+-- some unrelated row/spacer/button elsewhere - same reasoning UI_Main.lua's
+-- CreateBenchRow documents for its own bench-row invite button.
+local function AttachRemoveButton(rowGroup, row)
+  local removeBtn = CreateRemoveButton(rowGroup.frame, function()
+    RemoveRow(row)
+  end)
+  removeBtn:SetPoint("RIGHT", rowGroup.frame, "RIGHT", -4, 0)
+  rowGroup.frame.miaRemoveBtn = removeBtn
+  rowGroup.OnRelease = function(self)
+    self.frame.miaRemoveBtn:Hide()
+    self.frame.miaRemoveBtn:SetParent(UIParent)
+    self.frame.miaRemoveBtn = nil
   end
 end
 
-local function OnHeaderClick(columnKey)
-  if sortColumn == columnKey then
-    sortAscending = not sortAscending
-  else
-    sortColumn = columnKey
-    sortAscending = true
-  end
-  RenderRows()
-end
-
-local function CreateRow(row)
+local function CreateEditRow(row)
   local rowGroup = AceGUI:Create("SimpleGroup")
   rowGroup:SetLayout("Flow")
   rowGroup:SetFullWidth(true)
+  rowGroup.noAutoHeight = true
+  rowGroup:SetHeight(ROW_HEIGHT)
 
   local nameBox = AceGUI:Create("EditBox")
   nameBox:SetRelativeWidth(ROW_RELWIDTHS.name)
@@ -148,34 +336,112 @@ local function CreateRow(row)
   end)
   rowGroup:AddChild(classDropdown)
 
-  local removeBtn = AceGUI:Create("Button")
-  removeBtn:SetText("Remove")
-  removeBtn:SetRelativeWidth(ROW_RELWIDTHS.remove)
-  ns.ShrinkButtonFont(removeBtn)
-  removeBtn:SetCallback("OnClick", function()
-    RemoveRow(row)
+  local saveBtn = AceGUI:Create("Button")
+  saveBtn:SetText("Save")
+  saveBtn:SetRelativeWidth(ROW_RELWIDTHS.action)
+  ns.ShrinkButtonFont(saveBtn)
+  saveBtn:SetCallback("OnClick", function()
+    SaveRow(row)
   end)
-  rowGroup:AddChild(removeBtn)
+  rowGroup:AddChild(saveBtn)
+
+  AttachRemoveButton(rowGroup, row)
 
   return rowGroup
 end
 
+local function CreateDisplayRow(row)
+  local rowGroup = AceGUI:Create("SimpleGroup")
+  rowGroup:SetLayout("Flow")
+  rowGroup:SetFullWidth(true)
+  rowGroup.noAutoHeight = true
+  rowGroup:SetHeight(ROW_HEIGHT)
+
+  local nameLabel = AceGUI:Create("Label")
+  nameLabel:SetRelativeWidth(ROW_RELWIDTHS.name)
+  nameLabel:SetText(row.name)
+  ns.PadLabelVertically(nameLabel, ROW_HEIGHT)
+  ApplyClassColor(nameLabel, row.class)
+  rowGroup:AddChild(nameLabel)
+
+  local realmLabel = AceGUI:Create("Label")
+  realmLabel:SetRelativeWidth(ROW_RELWIDTHS.realm)
+  realmLabel:SetText(row.realm)
+  ns.PadLabelVertically(realmLabel, ROW_HEIGHT)
+  ApplyClassColor(realmLabel, row.class)
+  rowGroup:AddChild(realmLabel)
+
+  local classLabel = AceGUI:Create("Label")
+  classLabel:SetRelativeWidth(ROW_RELWIDTHS.class)
+  classLabel:SetText(ClassDisplayName(row.class))
+  ns.PadLabelVertically(classLabel, ROW_HEIGHT)
+  ApplyClassColor(classLabel, row.class)
+  rowGroup:AddChild(classLabel)
+
+  local editBtn = AceGUI:Create("Button")
+  editBtn:SetText("Edit")
+  editBtn:SetRelativeWidth(ROW_RELWIDTHS.action)
+  ns.ShrinkButtonFont(editBtn)
+  editBtn:SetCallback("OnClick", function()
+    StartEditingRow(row)
+  end)
+  rowGroup:AddChild(editBtn)
+
+  AttachRemoveButton(rowGroup, row)
+
+  return rowGroup
+end
+
+local function CreateRow(row)
+  if row.editing then
+    return CreateEditRow(row)
+  end
+  return CreateDisplayRow(row)
+end
+
+-- Below 3 characters, the search box doesn't filter at all (matches
+-- everything) - short fragments are more likely to be "still typing" than a
+-- meaningful search, and would otherwise churn the full row rebuild below on
+-- every single keystroke of a longer search for comparatively little
+-- narrowing benefit.
+local MIN_SEARCH_CHARS = 3
+
 RenderRows = function()
-  table.sort(workingRows, CompareRows)
-  UpdateHeaderLabel(nameHeader, "name", "Name")
-  UpdateHeaderLabel(realmHeader, "realm", "Realm")
-  UpdateHeaderLabel(classHeader, "class", "Class")
+  local needle = ns.Trim(searchText or ""):lower()
+  local filtering = #ns.Utf8Chars(needle) >= MIN_SEARCH_CHARS
+  -- Kept in sync here (the one place that actually knows the current
+  -- filtered/unfiltered state), rather than in the search box's
+  -- OnTextChanged callback, so it can't drift out of sync with reality
+  -- whenever something other than typing triggers a re-render (Remove,
+  -- Fetch Guild Info, Save, Add Player).
+  wasFiltering = filtering
+
+  -- ReleaseChildren below snaps the scroll position back to the top on its
+  -- own (rebuilding the content resets it) - every edit/save/remove/filter
+  -- goes through this same function, so without saving and restoring it
+  -- here, scrolling down and editing or saving a single row would bounce
+  -- the whole list back to the top every time. Same fix UI_Main.lua already
+  -- uses for its own player list (see RefreshPlayerList).
+  local savedScroll = scroll.localstatus and scroll.localstatus.scrollvalue or 0
 
   scroll:ReleaseChildren()
   for _, row in ipairs(workingRows) do
-    scroll:AddChild(CreateRow(row))
+    if not filtering or RowMatchesSearch(row, needle) then
+      scroll:AddChild(CreateRow(row))
+    end
   end
+
+  scroll:DoLayout()
+  scroll:SetScroll(savedScroll)
 end
 
 -- Fills any row with a blank class from the group/guild class scan (see
--- ns.GetClassMap in MakeIdiotsAppear.lua) - only touches the working copy,
--- same as every other edit here, so Save Changes still has to be clicked
--- to persist it. Returns how many rows it filled.
+-- ns.GetClassMap in MakeIdiotsAppear.lua). A row that's already saved gets
+-- the fetched class persisted immediately (its name/realm identity is
+-- already committed, so there's nothing to stage); a row that's still being
+-- edited and was never saved only gets its local class field/dropdown
+-- updated - there's no database identity to persist against yet, so it'll
+-- go out with that row's own Save. Returns how many rows it filled.
 local function FillMissingClasses()
   local classMap = ns.GetClassMap()
   local filled = 0
@@ -187,69 +453,20 @@ local function FillMissingClasses()
         local found = classMap[(name .. "-" .. realm):lower()]
         if found then
           row.class = found
+          if row.saved then
+            ns.UpsertPlayerDbEntry(row.saved.name, row.saved.realm, found)
+            row.saved.class = found
+          end
           filled = filled + 1
         end
       end
     end
   end
   if filled > 0 then
+    ns.FireStateChanged()
     RenderRows()
   end
   return filled
-end
-
-local function SaveChanges()
-  local validRows, errors, removeKeys, seen = {}, {}, {}, {}
-
-  for _, key in ipairs(pendingRemovals) do
-    table.insert(removeKeys, key)
-  end
-
-  for _, row in ipairs(workingRows) do
-    local rawName = row.name or ""
-    local label = rawName ~= "" and rawName or "(blank)"
-    local name = ns.ProperCase(ns.Trim(rawName))
-    local realmInput = ns.Trim(row.realm or "")
-    local realm = ns.NormalizeRealmName(realmInput)
-
-    if not ns.IsValidPlayerDbName(name) then
-      table.insert(errors, label .. " - invalid name (2-12 letters, no character repeated 3+ times in a row)")
-    elseif not realm then
-      table.insert(errors, label .. " - unrecognized realm '" .. (realmInput ~= "" and realmInput or "(blank)") .. "'")
-    else
-      local key = name:lower() .. "|" .. realm:lower()
-      if seen[key] then
-        table.insert(errors, name .. "-" .. realm .. " - duplicate entry, skipped")
-      else
-        seen[key] = true
-        -- A rename (name or realm changed from what this row was loaded
-        -- with) leaves the old name+realm key behind in the DB unless we
-        -- explicitly remove it too - upserting only ever adds/updates the
-        -- new key.
-        if row.origName and (row.origName:lower() ~= name:lower() or row.origRealm:lower() ~= realm:lower()) then
-          table.insert(removeKeys, { name = row.origName, realm = row.origRealm })
-        end
-        table.insert(validRows, { name = name, realm = realm, class = row.class })
-      end
-    end
-  end
-
-  for _, key in ipairs(removeKeys) do
-    ns.RemovePlayerDbEntry(key.name, key.realm)
-  end
-  for _, row in ipairs(validRows) do
-    ns.UpsertPlayerDbEntry(row.name, row.realm, row.class or false)
-  end
-
-  local msg = PREFIX .. "Saved " .. #validRows .. " player" .. (#validRows == 1 and "" or "s") .. "."
-  if #errors > 0 then
-    msg = msg .. " Skipped " .. #errors .. ": " .. table.concat(errors, "; ")
-  end
-  print(msg)
-
-  ns.FireStateChanged()
-  LoadWorkingRows()
-  RenderRows()
 end
 
 local function BuildPlayerDbFrame()
@@ -262,8 +479,14 @@ local function BuildPlayerDbFrame()
 
   MakeIdiotsAppearDB.windowStatus.playerdb = MakeIdiotsAppearDB.windowStatus.playerdb or {}
   f:SetStatusTable(MakeIdiotsAppearDB.windowStatus.playerdb)
+  -- AceGUI's Frame widget anchors its "Close" button to the window's own
+  -- BOTTOMRIGHT (see AceGUIContainer-Frame.lua's Constructor), not inside
+  -- the scrollable content area - so the content stack (toolbar + search box
+  -- + header + scroll, ~514px) needs real clearance below it or the scroll
+  -- area overlaps that button. 620 leaves ~60px of margin below the content
+  -- - confirmed enough to clear the Close button without excess empty space.
   f:SetWidth(620)
-  f:SetHeight(560)
+  f:SetHeight(620)
   f:SetCallback("OnClose", function(widget)
     AceGUI:Release(widget)
     playerDbFrame = nil
@@ -284,8 +507,18 @@ local function BuildPlayerDbFrame()
   addBtn:SetWidth(150)
   ns.ShrinkButtonFont(addBtn)
   addBtn:SetCallback("OnClick", function()
-    table.insert(workingRows, { name = "", realm = "", class = nil })
-    RenderRows()
+    local row = { name = "", realm = "", class = nil, editing = false, saved = nil }
+    -- Pinned to the top rather than sorted into its (empty-name) place -
+    -- keeps a just-added row immediately visible instead of requiring a
+    -- scroll to find it.
+    table.insert(workingRows, 1, row)
+    StartEditingRow(row)
+    -- StartEditingRow's RenderRows just restored whatever scroll position
+    -- was active before this click - if that was scrolled down, the row
+    -- just pinned to the top wouldn't actually be visible without an extra
+    -- manual scroll. Force it back to the top afterward so a new row is
+    -- always immediately visible to start typing into.
+    scroll:SetScroll(0)
   end)
   toolbar:AddChild(addBtn)
 
@@ -315,12 +548,30 @@ local function BuildPlayerDbFrame()
   end)
   toolbar:AddChild(fetchBtn)
 
-  local saveBtn = AceGUI:Create("Button")
-  saveBtn:SetText("Save Changes")
-  saveBtn:SetWidth(150)
-  ns.ShrinkButtonFont(saveBtn)
-  saveBtn:SetCallback("OnClick", SaveChanges)
-  toolbar:AddChild(saveBtn)
+  ----------------------------------------------------------------
+  -- Search box
+  ----------------------------------------------------------------
+
+  local searchBox = AceGUI:Create("EditBox")
+  searchBox:SetLabel("Search (name, realm, or class - 3+ characters)")
+  searchBox:SetFullWidth(true)
+  searchBox:DisableButton(true)
+  searchBox:SetText(searchText)
+  searchBox:SetCallback("OnTextChanged", function(widget, event, value)
+    searchText = value
+    local needle = ns.Trim(searchText or ""):lower()
+    local nowFiltering = #ns.Utf8Chars(needle) >= MIN_SEARCH_CHARS
+    -- Skip the rebuild entirely while under the threshold and nothing is
+    -- actually changing on screen (still showing everyone, same as the
+    -- keystroke before) - this is what keeps typing the first couple
+    -- characters of a search from re-rendering the full, unfiltered list on
+    -- every single keypress. RenderRows itself updates wasFiltering once it
+    -- actually runs.
+    if nowFiltering or wasFiltering then
+      RenderRows()
+    end
+  end)
+  f:AddChild(searchBox)
 
   ----------------------------------------------------------------
   -- Header row
@@ -331,28 +582,25 @@ local function BuildPlayerDbFrame()
   headerRow:SetFullWidth(true)
   f:AddChild(headerRow)
 
-  nameHeader = AceGUI:Create("InteractiveLabel")
+  local nameHeader = AceGUI:Create("Label")
   nameHeader:SetRelativeWidth(ROW_RELWIDTHS.name)
   nameHeader:SetText("Name")
-  nameHeader:SetCallback("OnClick", function() OnHeaderClick("name") end)
   headerRow:AddChild(nameHeader)
 
-  realmHeader = AceGUI:Create("InteractiveLabel")
+  local realmHeader = AceGUI:Create("Label")
   realmHeader:SetRelativeWidth(ROW_RELWIDTHS.realm)
   realmHeader:SetText("Realm")
-  realmHeader:SetCallback("OnClick", function() OnHeaderClick("realm") end)
   headerRow:AddChild(realmHeader)
 
-  classHeader = AceGUI:Create("InteractiveLabel")
+  local classHeader = AceGUI:Create("Label")
   classHeader:SetRelativeWidth(ROW_RELWIDTHS.class)
   classHeader:SetText("Class")
-  classHeader:SetCallback("OnClick", function() OnHeaderClick("class") end)
   headerRow:AddChild(classHeader)
 
-  local removeHeader = AceGUI:Create("Label")
-  removeHeader:SetRelativeWidth(ROW_RELWIDTHS.remove)
-  removeHeader:SetText("")
-  headerRow:AddChild(removeHeader)
+  local actionHeader = AceGUI:Create("Label")
+  actionHeader:SetRelativeWidth(ROW_RELWIDTHS.action)
+  actionHeader:SetText("")
+  headerRow:AddChild(actionHeader)
 
   ----------------------------------------------------------------
   -- Grid
