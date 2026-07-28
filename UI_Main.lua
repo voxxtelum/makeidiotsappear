@@ -1275,5 +1275,19 @@ SlashCmdList["MAKEIDIOTSAPPEAR"] = function(msg)
     return
   end
 
+  if msg == "cat" then
+    local fact = ns.CatFacts[math.random(#ns.CatFacts)]
+    local text = "[Cat Facts] " .. fact
+    if IsInGuild() then
+      local ok, err = ns.SendChat(text, "GUILD")
+      if not ok then
+        print(PREFIX .. "Could not send the cat fact (" .. tostring(err) .. ").")
+      end
+    else
+      print(text)
+    end
+    return
+  end
+
   ToggleMainFrame()
 end

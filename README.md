@@ -32,6 +32,8 @@ Builds a database of player names, realms, and classes automatically as people j
 
 `/mia playerdb` to open Player Database editor
 
+`/mia cat` cat
+
 ### Everything Else
 
 - Class-colored player list with live online/invite status

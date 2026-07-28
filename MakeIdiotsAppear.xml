@@ -1,5 +1,6 @@
 <Ui xmlns="http://www.blizzard.com/wow/ui/">
     <Script file="MakeIdiotsAppear.lua"/>
+    <Script file="CatFacts.lua"/>
     <Script file="GroupComps.lua"/>
     <Script file="UI_Settings.lua"/>
     <Script file="UI_Rosters.lua"/>

@@ -948,6 +948,7 @@ local function SendChat(message, chatType, target)
   end
   return pcall(sender, message, chatType, nil, target)
 end
+ns.SendChat = SendChat
 
 -- Prepends the user-configured prefix (e.g. "[MIA]") to every automated
 -- message. A blank prefix is how a user disables it, so an empty string is
