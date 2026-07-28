@@ -6,23 +6,23 @@ The real idiots were the friends we invited along the way.
 
 `Alt+F4` to make it someone else's problem.
 
-#### Auto Invite
+### Auto Invite
 
 Build a roster, click **Start**, and let the addon handle sending invites while you contemplate your life choices.
 
-#### Roster Manager
+### Roster Manager
 
 Save named raid rosters using the `Name-Realm` format. It remembers realms you've already seen, so you don't have to keep typing `-OldBlanchy` for the hundredth time.
 
-#### Group Manager
+### Group Manager
 
 Drag players into the groups where they actually belong, save multiple raid comps for each roster, and click **Apply Groups** to sort everyone automatically.
 
-#### Player Database
+### Player Database
 
 Builds a database of player names, realms, and classes automatically as people join your raids. Search it, fix mistakes, add players manually, or fill in missing class information directly from your guild roster.
 
-#### Commands
+### Commands
 
 `/mia settings` to open Settings
 
@@ -32,7 +32,7 @@ Builds a database of player names, realms, and classes automatically as people j
 
 `/mia playerdb` to open Player Database editor
 
-#### Everything Else
+### Everything Else
 
 - Class-colored player list with live online/invite status
 - Durability warnings, because someone is always at 15%
