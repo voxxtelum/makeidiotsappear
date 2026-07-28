@@ -49,12 +49,13 @@ local function IsElvUILoaded()
 end
 
 -- Swaps AceGUI's Frame widget's own default look (the thick ornate
--- Interface\DialogFrame\UI-DialogBox-Border/Header) for a plainer Blizzard
--- tooltip-style border - the same edgeFile/tileSize/insets AceGUI's own
--- InlineGroup/TabGroup widgets already use for panel borders elsewhere in
--- this addon (see PaneBackdrop in AceGUIContainer-InlineGroup.lua), so it's
--- already known to render fine on this client. Keeps the same parchment
--- background texture - only the edge art and its proportions change.
+-- Interface\DialogFrame\UI-DialogBox-Border/Header, on a parchment
+-- background) for a plainer Blizzard tooltip-style look instead - both the
+-- edgeFile (the same one AceGUI's own InlineGroup/TabGroup widgets already
+-- use for panel borders elsewhere in this addon, see PaneBackdrop in
+-- AceGUIContainer-InlineGroup.lua) and the bgFile, tinted black via
+-- ApplyTooltipWindowStyle's own SetBackdropColor below to match a normal
+-- game tooltip's solid dark look rather than the lighter parchment tone.
 --
 -- The ornate rope-and-post title banner is a separate thing entirely - not
 -- part of the backdrop, but three individual textures (a center piece plus
@@ -72,9 +73,11 @@ end
 -- backdrop-related would be - so this hides titlebg directly, then any
 -- other texture region on frame whose anchor points back to it.
 local WINDOW_BORDER = {
-  bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+  bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
   edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-  tile = true, tileSize = 16, edgeSize = 16,
+  tile = true,
+  tileSize = 16,
+  edgeSize = 16,
   insets = { left = 3, right = 3, top = 3, bottom = 3 },
 }
 
@@ -93,6 +96,13 @@ local function ApplyTooltipWindowStyle(aceFrame)
 
   local frame = aceFrame.frame
   frame:SetBackdrop(WINDOW_BORDER)
+  -- AceGUI's own Frame widget only ever calls SetBackdropColor once, for
+  -- its original default backdrop (see AceGUIContainer-Frame.lua's
+  -- Constructor) - swapping the backdrop via SetBackdrop above doesn't
+  -- re-assert a color/opacity for the new one, leaving it rendering
+  -- translucent instead of solid. Full black at full alpha is what gives
+  -- this a normal, solid game-tooltip look.
+  frame:SetBackdropColor(0, 0, 0, 1)
 
   local titlebg = aceFrame.titlebg
   titlebg:Hide()
@@ -253,9 +263,12 @@ local function EnsureDB()
   end
 
   MakeIdiotsAppearDB.settings = MakeIdiotsAppearDB.settings or {}
-  MakeIdiotsAppearDB.windowStatus = MakeIdiotsAppearDB.windowStatus or {}   -- per-window {width, height, top, left}, see AceGUI's SetStatusTable
-  MakeIdiotsAppearDB.groupComps = MakeIdiotsAppearDB.groupComps or {}       -- [rosterName] = {activeComp=name, comps={{name=,groups={[1..8]={...}}}, ...}}, see GroupComps.lua
-  MakeIdiotsAppearDB.rosterGroupSizes = MakeIdiotsAppearDB.rosterGroupSizes or {} -- [rosterName] = 10|20|40, defaults to 20 when unset, see UI_Rosters.lua
+  MakeIdiotsAppearDB.windowStatus = MakeIdiotsAppearDB.windowStatus or
+      {} -- per-window {width, height, top, left}, see AceGUI's SetStatusTable
+  MakeIdiotsAppearDB.groupComps = MakeIdiotsAppearDB.groupComps or
+      {} -- [rosterName] = {activeComp=name, comps={{name=,groups={[1..8]={...}}}, ...}}, see GroupComps.lua
+  MakeIdiotsAppearDB.rosterGroupSizes = MakeIdiotsAppearDB.rosterGroupSizes or
+      {} -- [rosterName] = 10|20|40, defaults to 20 when unset, see UI_Rosters.lua
 
   local settings = MakeIdiotsAppearDB.settings
   if settings.lastList and not settings.activeRoster then
@@ -823,29 +836,29 @@ ns.GetClassList = GetClassList
 ----------------------------------------------------------------------
 
 local Engine = {
-  queue = {},          -- names left to invite in the current pass
-  nextQueue = {},      -- names bounced/expired/still-missing this pass, held back for the next scheduled interval
-  fullRoster = {},     -- the complete set of names this invite run is trying to get grouped
+  queue = {},      -- names left to invite in the current pass
+  nextQueue = {},  -- names bounced/expired/still-missing this pass, held back for the next scheduled interval
+  fullRoster = {}, -- the complete set of names this invite run is trying to get grouped
   running = false,
   starting = false,
   ticker = nil,
   startTimer = nil,
-  durabilityTicker = nil, -- retries durability requests every few seconds as a backstop, see StartInvites
-  pendingInvites = {},   -- [lowercased "name-realm"] = fullName, currently invited but not yet confirmed
+  durabilityTicker = nil,   -- retries durability requests every few seconds as a backstop, see StartInvites
+  pendingInvites = {},      -- [lowercased "name-realm"] = fullName, currently invited but not yet confirmed
   pendingInviteSentAt = {}, -- [lowercased "name-realm"] = GetTime() when that invite was sent
-  skipped = {},          -- names whispered this pass because they're already in another group, or still missing a realm
-  nextPassAt = nil,      -- GetTime() timestamp of the next scheduled invite pass, if any
-  convertingToRaid = nil, -- true while waiting on a pending party->raid conversion
-  convertRetryCount = 0,  -- how many times we've waited on that conversion so far
+  skipped = {},             -- names whispered this pass because they're already in another group, or still missing a realm
+  nextPassAt = nil,         -- GetTime() timestamp of the next scheduled invite pass, if any
+  convertingToRaid = nil,   -- true while waiting on a pending party->raid conversion
+  convertRetryCount = 0,    -- how many times we've waited on that conversion so far
 
   -- Durability checks (see the LibDurability section below). Keyed by bare
   -- lowercase name, not "name-realm" - LibDurability's wire protocol only
   -- ever gives us a bare character name (via Ambiguate), so two same-named
   -- characters on different realms can't be told apart here; this mirrors
   -- the ambiguity the library itself imposes, not something we can avoid.
-  durabilityChecked = {},          -- [lowercase name] = true, already warned or found fine this run
-  durabilityPending = {},          -- [lowercase name] = fullName, joined and awaiting a durability reply this pass
-  durabilityUnknownThisPass = {},  -- fullNames whose check never got a reply before this pass ended
+  durabilityChecked = {},         -- [lowercase name] = true, already warned or found fine this run
+  durabilityPending = {},         -- [lowercase name] = fullName, joined and awaiting a durability reply this pass
+  durabilityUnknownThisPass = {}, -- fullNames whose check never got a reply before this pass ended
 }
 ns.Engine = Engine
 
@@ -1029,7 +1042,8 @@ end
 -- batched message rather than leaving the check hanging forever.
 local function ReportDurabilityUnknown()
   for key, fullName in pairs(Engine.durabilityPending) do
-    DebugPrint(string.format("Timing out durability check for '%s' (key='%s') - never got a reply this pass.", fullName, key))
+    DebugPrint(string.format("Timing out durability check for '%s' (key='%s') - never got a reply this pass.", fullName,
+      key))
     table.insert(Engine.durabilityUnknownThisPass, fullName)
     Engine.durabilityPending[key] = nil
   end
@@ -1056,8 +1070,8 @@ LD:Register(ns, function(percent, broken, name, channel)
       table.insert(pendingList, pendingName)
     end
     DebugPrint(string.format(
-        "Durability reply from '%s' (key='%s'): %d%%, matched=%s | currently pending: %s",
-        name, key, percent, tostring(fullName), #pendingList > 0 and table.concat(pendingList, ", ") or "(none)"))
+      "Durability reply from '%s' (key='%s'): %d%%, matched=%s | currently pending: %s",
+      name, key, percent, tostring(fullName), #pendingList > 0 and table.concat(pendingList, ", ") or "(none)"))
   end
 
   if not fullName then return end
@@ -1217,7 +1231,8 @@ RunInvitePass = function()
       if confirmedSize + CountPendingInvites() >= 5 then
         Engine.convertRetryCount = Engine.convertRetryCount + 1
         if Engine.convertRetryCount > 6 then
-          print(PREFIX .. "Could not convert to a raid automatically - please use /convert to raid manually, then click Start Invites again.")
+          print(PREFIX ..
+            "Could not convert to a raid automatically - please use /convert to raid manually, then click Start Invites again.")
           Engine.convertingToRaid = nil
           Engine.convertRetryCount = 0
           FireStateChanged()
@@ -1333,8 +1348,8 @@ RunInvitePass = function()
     end
     Engine.skipped = {}
     print(PREFIX .. string.format(
-        "Pass complete. Retrying %d player(s) still not in the group in %ds.",
-        #stragglers, MakeIdiotsAppearDB.settings.interval))
+      "Pass complete. Retrying %d player(s) still not in the group in %ds.",
+      #stragglers, MakeIdiotsAppearDB.settings.interval))
     FireStateChanged()
   else
     -- Nobody needs a fresh invite this pass - everyone still missing has one
@@ -1344,8 +1359,8 @@ RunInvitePass = function()
     -- genuinely outstanding.
     Engine.skipped = {}
     print(PREFIX .. string.format(
-        "Pass complete. Waiting on %d still-pending invite(s), next check in %ds.",
-        CountPendingInvites(), MakeIdiotsAppearDB.settings.interval))
+      "Pass complete. Waiting on %d still-pending invite(s), next check in %ds.",
+      CountPendingInvites(), MakeIdiotsAppearDB.settings.interval))
     FireStateChanged()
   end
 end

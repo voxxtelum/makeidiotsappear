@@ -279,35 +279,77 @@ local function RowMatchesSearch(row, needle)
     or class:find(needle, 1, true) ~= nil
 end
 
+-- Same background technique as UI_Main.lua's own player list (PrepareRow) -
+-- a plain BACKGROUND-layer texture, black at 0.5 alpha (bumped up from that
+-- list's own 0.18 - this window's tooltip-style backdrop reads darker, so
+-- the lighter value was too faint to see against it) - reused here for
+-- visual consistency with the rest of the addon otherwise. Cached on the
+-- frame itself (rather than created fresh every render) and just
+-- shown/hidden after that, same as PrepareRow's own riRowBg - this exact
+-- raw frame is very likely to get reused across this window's own
+-- re-renders (AceGUI recycles "SimpleGroup" widgets by type - see
+-- FinalizeRow's own comment below), so this avoids piling up a fresh
+-- throwaway texture on it every single time.
+local function ApplyRowBackground(frame, show)
+  if not frame.miaRowBg then
+    local bg = frame:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(frame)
+    if bg.SetColorTexture then
+      bg:SetColorTexture(0, 0, 0, 0.5)
+    else
+      bg:SetTexture(1, 1, 1, 1)
+      bg:SetVertexColor(0, 0, 0, 0.5)
+    end
+    frame.miaRowBg = bg
+  end
+  frame.miaRowBg:SetShown(show)
+end
+
 -- Parents a native remove icon directly onto rowGroup.frame (not added via
--- :AddChild - see ROW_RELWIDTHS' own comment for why) and wires up cleanup
--- so it can't leak into some other window's SimpleGroup later. AceGUI
--- recycles "SimpleGroup" widgets by type across this entire addon (every
--- row here is a fresh one each render - see RenderRows/CreateRow), and
--- HookScript-free plain child frames parented this way aren't reachable
--- through AceGUI's own ReleaseChildren, so without this they'd still be
--- sitting there the next time this exact recycled frame gets handed out as
--- some unrelated row/spacer/button elsewhere - same reasoning UI_Main.lua's
--- CreateBenchRow documents for its own bench-row invite button.
+-- :AddChild - see ROW_RELWIDTHS' own comment for why), applies the striped
+-- background above, and wires up cleanup for both so neither can leak into
+-- some other window's SimpleGroup later. AceGUI recycles "SimpleGroup"
+-- widgets by type across this entire addon (every row here is a fresh one
+-- each render - see RenderRows/CreateRow), and HookScript-free plain child
+-- frames/textures parented this way aren't reachable through AceGUI's own
+-- ReleaseChildren, so without this they'd still be sitting there the next
+-- time this exact recycled frame gets handed out as some unrelated
+-- row/spacer/button elsewhere - same reasoning UI_Main.lua's CreateBenchRow
+-- documents for its own bench-row invite button.
 --
--- actionBtn is the row's own Edit/Save button, already added - anchoring to
--- its frame (rather than the row's own right edge) is what keeps the remove
--- icon sitting right next to it instead of out at the row's full width,
--- since ROW_RELWIDTHS.action only fills a fraction of that width.
-local function AttachRemoveButton(rowGroup, row, actionBtn)
+-- actionBtn is the row's own Edit/Save button, already added - anchoring the
+-- remove icon to its frame (rather than the row's own right edge) is what
+-- keeps it sitting right next to it instead of out at the row's full width,
+-- since ROW_RELWIDTHS.action only fills a fraction of that width. isEven
+-- controls the striped background - see RenderRows for how it's computed.
+local function FinalizeRow(rowGroup, row, actionBtn, isEven)
   local removeBtn = CreateRemoveButton(rowGroup.frame, function()
     RemoveRow(row)
   end)
   removeBtn:SetPoint("LEFT", actionBtn.frame, "RIGHT", 6, 0)
   rowGroup.frame.miaRemoveBtn = removeBtn
+
+  ApplyRowBackground(rowGroup.frame, isEven)
+
+  -- Nil-checked because this same widget can later be handed out to a
+  -- totally different window (AceGUI recycles "SimpleGroup" by type
+  -- addon-wide, and never clears widget.OnRelease when it goes back into
+  -- the pool - see this function's own comment above) - when that other
+  -- window eventually releases it, this same handler fires again, and by
+  -- then miaRemoveBtn is already nil (that window never set it).
   rowGroup.OnRelease = function(self)
-    self.frame.miaRemoveBtn:Hide()
-    self.frame.miaRemoveBtn:SetParent(UIParent)
-    self.frame.miaRemoveBtn = nil
+    if self.frame.miaRemoveBtn then
+      self.frame.miaRemoveBtn:Hide()
+      self.frame.miaRemoveBtn:SetParent(UIParent)
+      self.frame.miaRemoveBtn = nil
+    end
+    if self.frame.miaRowBg then
+      self.frame.miaRowBg:Hide()
+    end
   end
 end
 
-local function CreateEditRow(row)
+local function CreateEditRow(row, isEven)
   local rowGroup = AceGUI:Create("SimpleGroup")
   rowGroup:SetLayout("Flow")
   rowGroup:SetFullWidth(true)
@@ -350,12 +392,12 @@ local function CreateEditRow(row)
   end)
   rowGroup:AddChild(saveBtn)
 
-  AttachRemoveButton(rowGroup, row, saveBtn)
+  FinalizeRow(rowGroup, row, saveBtn, isEven)
 
   return rowGroup
 end
 
-local function CreateDisplayRow(row)
+local function CreateDisplayRow(row, isEven)
   local rowGroup = AceGUI:Create("SimpleGroup")
   rowGroup:SetLayout("Flow")
   rowGroup:SetFullWidth(true)
@@ -392,16 +434,16 @@ local function CreateDisplayRow(row)
   end)
   rowGroup:AddChild(editBtn)
 
-  AttachRemoveButton(rowGroup, row, editBtn)
+  FinalizeRow(rowGroup, row, editBtn, isEven)
 
   return rowGroup
 end
 
-local function CreateRow(row)
+local function CreateRow(row, isEven)
   if row.editing then
-    return CreateEditRow(row)
+    return CreateEditRow(row, isEven)
   end
-  return CreateDisplayRow(row)
+  return CreateDisplayRow(row, isEven)
 end
 
 -- Below 3 characters, the search box doesn't filter at all (matches
@@ -430,9 +472,15 @@ RenderRows = function()
   local savedScroll = scroll.localstatus and scroll.localstatus.scrollvalue or 0
 
   scroll:ReleaseChildren()
+  -- Counts only rows actually being shown, not each row's position in the
+  -- underlying (possibly filtered-down) data - so the striping still comes
+  -- out as a clean alternating pattern based on what's actually on screen,
+  -- rather than having gaps in it wherever a filtered-out row would've sat.
+  local visibleCount = 0
   for _, row in ipairs(workingRows) do
     if not filtering or RowMatchesSearch(row, needle) then
-      scroll:AddChild(CreateRow(row))
+      visibleCount = visibleCount + 1
+      scroll:AddChild(CreateRow(row, visibleCount % 2 == 0))
     end
   end
 
@@ -602,6 +650,13 @@ local function BuildPlayerDbFrame()
   -- instead.
   headerRow:SetWidth(566)
   f:AddChild(headerRow)
+
+  ApplyRowBackground(headerRow.frame, true)
+  headerRow.OnRelease = function(self)
+    if self.frame.miaRowBg then
+      self.frame.miaRowBg:Hide()
+    end
+  end
 
   local nameHeader = AceGUI:Create("Label")
   nameHeader:SetRelativeWidth(ROW_RELWIDTHS.name)
