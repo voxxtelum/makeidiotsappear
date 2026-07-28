@@ -289,11 +289,16 @@ end
 -- sitting there the next time this exact recycled frame gets handed out as
 -- some unrelated row/spacer/button elsewhere - same reasoning UI_Main.lua's
 -- CreateBenchRow documents for its own bench-row invite button.
-local function AttachRemoveButton(rowGroup, row)
+--
+-- actionBtn is the row's own Edit/Save button, already added - anchoring to
+-- its frame (rather than the row's own right edge) is what keeps the remove
+-- icon sitting right next to it instead of out at the row's full width,
+-- since ROW_RELWIDTHS.action only fills a fraction of that width.
+local function AttachRemoveButton(rowGroup, row, actionBtn)
   local removeBtn = CreateRemoveButton(rowGroup.frame, function()
     RemoveRow(row)
   end)
-  removeBtn:SetPoint("RIGHT", rowGroup.frame, "RIGHT", -4, 0)
+  removeBtn:SetPoint("LEFT", actionBtn.frame, "RIGHT", 6, 0)
   rowGroup.frame.miaRemoveBtn = removeBtn
   rowGroup.OnRelease = function(self)
     self.frame.miaRemoveBtn:Hide()
@@ -345,7 +350,7 @@ local function CreateEditRow(row)
   end)
   rowGroup:AddChild(saveBtn)
 
-  AttachRemoveButton(rowGroup, row)
+  AttachRemoveButton(rowGroup, row, saveBtn)
 
   return rowGroup
 end
@@ -387,7 +392,7 @@ local function CreateDisplayRow(row)
   end)
   rowGroup:AddChild(editBtn)
 
-  AttachRemoveButton(rowGroup, row)
+  AttachRemoveButton(rowGroup, row, editBtn)
 
   return rowGroup
 end
@@ -579,7 +584,23 @@ local function BuildPlayerDbFrame()
 
   local headerRow = AceGUI:Create("SimpleGroup")
   headerRow:SetLayout("Flow")
-  headerRow:SetFullWidth(true)
+  -- Deliberately not SetFullWidth(true). The grid below lives inside a
+  -- ScrollFrame, whose content area narrows by a fixed 20px the moment its
+  -- scrollbar actually appears - i.e. once there are more rows than fit on
+  -- screen (see AceGUIContainer-ScrollFrame.lua's FixScroll,
+  -- SetPoint("BOTTOMRIGHT", -20, 0)) - a near-certainty for this window in
+  -- practice (a guild roster easily exceeds a screenful of names). This
+  -- header row's cells are relative-width, computed against whatever
+  -- container they sit in - if the header spanned the window's full content
+  -- width while the rows below compute against that already-narrowed
+  -- scroll content, the two would drift out of alignment right when a
+  -- scrollbar shows up. AceGUI's Frame widget insets its content area by
+  -- 17px on each side (AceGUIContainer-Frame.lua's Constructor), so at this
+  -- window's fixed 620px width (EnableResize(false), so this never
+  -- changes) the content area is 620 - 17*2 = 586px; matching the scroll's
+  -- own narrowed width means giving the header that same 586 - 20 = 566px
+  -- instead.
+  headerRow:SetWidth(566)
   f:AddChild(headerRow)
 
   local nameHeader = AceGUI:Create("Label")
