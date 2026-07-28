@@ -3,6 +3,7 @@
 The real idiots were the friends we invited along the way.
 
 `/mia` to open.
+
 `Alt+F4` to make it someone else's problem.
 
 #### Auto Invite
@@ -24,8 +25,11 @@ Builds a database of player names, realms, and classes automatically as people j
 #### Commands
 
 `/mia settings` to open Settings
+
 `/mia rosters` to open Rosters editor
+
 `/mia groups` to open Groups editor
+
 `/mia playerdb` to open Player Database editor
 
 #### Everything Else
