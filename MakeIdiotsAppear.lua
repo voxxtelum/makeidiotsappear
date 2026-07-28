@@ -742,9 +742,13 @@ local function GetOnlineGuildMembersMap()
   return map
 end
 
--- Class is only knowable for players we can currently see - our group, or
--- our guild roster. Group data wins when both are available since it's live.
--- Keyed by full "name-realm", same as GetGroupNameSet/GetGuildOnlineMap.
+-- Class comes from three tiers, in priority order: our current group (live,
+-- so it wins when available), our guild roster, then the Player Database
+-- (MakeIdiotsAppearDB.masterRoster, see GetAllPlayerDbEntries) - covering
+-- anyone whose class was learned from a past group or entered manually via
+-- /mia playerdb, even if they're not in the guild and not currently grouped
+-- with you. Keyed by full "name-realm", same as
+-- GetGroupNameSet/GetGuildOnlineMap.
 local function GetClassMap()
   local map = {}
 
@@ -778,6 +782,17 @@ local function GetClassMap()
         if key and classFileName and not map[key] then
           map[key] = classFileName
         end
+      end
+    end
+  end
+
+  -- Third tier: the Player Database. Only fills gaps neither the group nor
+  -- guild scan above already covered.
+  for _, entry in ipairs(GetAllPlayerDbEntries()) do
+    if entry.class then
+      local key = (entry.name .. "-" .. entry.realm):lower()
+      if not map[key] then
+        map[key] = entry.class
       end
     end
   end
