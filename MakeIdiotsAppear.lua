@@ -114,30 +114,59 @@ end
 ns.ApplyTooltipWindowStyle = ApplyTooltipWindowStyle
 
 -- Closes an AceGUI Frame on Escape, opt-in per window (not applied to the
--- main window) - AceGUI's Frame widget creates its underlying frame with no
--- global name (see AceGUIContainer-Frame.lua's Constructor), so the usual
--- UISpecialFrames trick doesn't apply without patching that vendored
--- library. EnableKeyboard broadcasts OnKeyDown to every keyboard-enabled
--- frame regardless of what actually has focus (that's what lets this work
--- even while some nested EditBox owns real keyboard focus) -
--- SetPropagateKeyboardInput(true) is the default so every other key still
--- passes through untouched; only an actual ESCAPE press flips it off for
--- that one keypress so it doesn't also fall through to the default Game
--- Menu. aceFrame:Hide() (not frame:Hide()) so this always goes through the
--- same OnClose callback each window already wires up to its own Close
--- button, rather than being a second, separately-maintained close path.
+-- main window - see ns.DisableWindowEscapeClose below). AceGUI's Frame
+-- widget creates its underlying frame with no global name (see
+-- AceGUIContainer-Frame.lua's Constructor), so the usual UISpecialFrames
+-- trick doesn't apply without patching that vendored library. EnableKeyboard
+-- broadcasts OnKeyDown to every keyboard-enabled frame regardless of what
+-- actually has focus (that's what lets this work even while some nested
+-- EditBox owns real keyboard focus) - SetPropagateKeyboardInput(true) is the
+-- default so every other key still passes through untouched; only an actual
+-- ESCAPE press flips it off for that one keypress so it doesn't also fall
+-- through to the default Game Menu.
+--
+-- AceGUI recycles "Frame" widgets - the raw frame and its AceGUI widget
+-- table as one permanently-paired unit - across every window in this addon
+-- that ever calls AceGUI:Create("Frame"), keyed only by widget type, not by
+-- which logical window is using it (see its objPools). frame:HookScript
+-- can't be undone, so installing an unconditional "ESCAPE always closes"
+-- hook here the first time a window opts in would keep firing forever after
+-- that, even once this same (frame, widget) pair gets recycled out to some
+-- other window that never called this function itself - which is exactly
+-- how the main window could start closing on Escape after the roster or
+-- player database window (both opt in) had merely been opened and closed at
+-- least once. So the hook is installed at most once per raw frame (guarded
+-- by .miaEscHooked) and checks a flag stored on the frame every time it
+-- fires, rather than closing unconditionally - this function turns that flag
+-- on; ns.DisableWindowEscapeClose explicitly turns it back off, so a window
+-- that never opts in can't be left silently opted-in by a hand-me-down
+-- frame.
 local function CloseWindowOnEscape(aceFrame)
   local frame = aceFrame.frame
+  frame.miaCloseOnEscape = true
+  if frame.miaEscHooked then return end
+  frame.miaEscHooked = true
+
   frame:EnableKeyboard(true)
   frame:SetPropagateKeyboardInput(true)
   frame:HookScript("OnKeyDown", function(self, key)
-    if key == "ESCAPE" then
+    if key == "ESCAPE" and self.miaCloseOnEscape then
       self:SetPropagateKeyboardInput(false)
       aceFrame:Hide()
     end
   end)
 end
 ns.CloseWindowOnEscape = CloseWindowOnEscape
+
+-- Explicitly opts an AceGUI Frame out of the Escape-to-close behavior above.
+-- Only needed by windows that never call CloseWindowOnEscape themselves
+-- (currently just the main window), as a guard against inheriting a stale
+-- "on" flag from a previous window that had opted in and later released
+-- this same recycled frame (see CloseWindowOnEscape's own comment).
+local function DisableWindowEscapeClose(aceFrame)
+  aceFrame.frame.miaCloseOnEscape = false
+end
+ns.DisableWindowEscapeClose = DisableWindowEscapeClose
 
 -- AceGUI's Button widget exposes its text FontString directly as .text;
 -- shrink it relative to whatever size/font it already has rather than
@@ -263,7 +292,20 @@ local function EnsureDB()
   end
 
   MakeIdiotsAppearDB.rosters = MakeIdiotsAppearDB.rosters or {}
-  MakeIdiotsAppearDB.masterRoster = MakeIdiotsAppearDB.masterRoster or {}   -- [lowercase name] = "Realm"
+  -- [lowercase name] = { [lowercase realm] = { realm = "ProperRealm", class = "WARRIOR" or nil } }
+  -- A name can be known on more than one realm (e.g. two different real
+  -- people both named "Tanku" on different realms), so this is keyed two
+  -- levels deep rather than assuming one realm per name.
+  MakeIdiotsAppearDB.masterRoster = MakeIdiotsAppearDB.masterRoster or {}
+
+  -- migrate pre-multi-realm entries, where the value was just a plain realm
+  -- string (masterRoster[name] = "Realm") instead of today's nested shape.
+  for name, value in pairs(MakeIdiotsAppearDB.masterRoster) do
+    if type(value) == "string" then
+      MakeIdiotsAppearDB.masterRoster[name] = { [value:lower()] = { realm = value, class = nil } }
+    end
+  end
+
   MakeIdiotsAppearDB.settings = MakeIdiotsAppearDB.settings or {}
   MakeIdiotsAppearDB.windowStatus = MakeIdiotsAppearDB.windowStatus or {}   -- per-window {width, height, top, left}, see AceGUI's SetStatusTable
   MakeIdiotsAppearDB.groupComps = MakeIdiotsAppearDB.groupComps or {}       -- [rosterName] = {activeComp=name, comps={{name=,groups={[1..8]={...}}}, ...}}, see GroupComps.lua
@@ -349,11 +391,106 @@ local function trim(s)
 end
 ns.Trim = trim
 
+-- Splits a UTF-8 string into an array of individual character byte-strings
+-- (1-4 bytes each, per each character's own leading byte). Lua's string
+-- library is byte-oriented (#str, :sub(), :upper()/:lower() all operate on
+-- bytes, not characters), which silently breaks the moment a name contains
+-- an accented letter like "é" (2 bytes) - #str over/undercounts it, and
+-- :sub(1,1) grabs only half the character instead of all of it. Anywhere
+-- below that needs to reason about actual characters walks the string via
+-- this instead.
+local function Utf8Chars(str)
+  local chars = {}
+  local i, len = 1, #str
+  while i <= len do
+    local b = str:byte(i)
+    local charLen = 1
+    if b >= 0xF0 then
+      charLen = 4
+    elseif b >= 0xE0 then
+      charLen = 3
+    elseif b >= 0xC0 then
+      charLen = 2
+    end
+    table.insert(chars, str:sub(i, i + charLen - 1))
+    i = i + charLen
+  end
+  return chars
+end
+ns.Utf8Chars = Utf8Chars
+
+-- :lower()/:upper() only remap plain ASCII 'A'-'Z'/'a'-'z' bytes and leave
+-- everything else untouched (including every byte of a multi-byte accented
+-- character) - so str:lower() on a whole name is always byte-safe, but
+-- capitalizing "just the first character" has to go through Utf8Chars
+-- first, or a name starting with an accented letter (2-4 bytes) would get
+-- truncated to its first byte by a plain :sub(1,1). An accented first
+-- letter itself can't actually be uppercased this way (Lua has no Unicode
+-- case folding here) - it just passes through as typed instead, which is
+-- the safe fallback rather than corrupting it.
 local function ProperCase(str)
   if not str or str == "" then return str end
   str = str:lower()
-  return str:sub(1, 1):upper() .. str:sub(2)
+  local chars = Utf8Chars(str)
+  chars[1] = chars[1]:upper()
+  return table.concat(chars)
 end
+ns.ProperCase = ProperCase
+
+-- Character-name validity: 2-12 characters, letters only - ASCII or
+-- accented (e.g. "æ"/"á", which WoW character names allow) - just not
+-- digits/punctuation/whitespace, and no character repeated 3+ times in a
+-- row. Digits/punctuation/whitespace are always single ASCII bytes and
+-- never appear inside a multi-byte UTF-8 character, so screening those out
+-- via %d/%p/%s is enough to let any accented letter through without having
+-- to positively enumerate every letter WoW's locales support.
+local function IsValidPlayerDbName(name)
+  if not name or name == "" then return false end
+  if name:find("[%d%p%s]") then return false end
+
+  local chars = Utf8Chars(name)
+  if #chars < 2 or #chars > 12 then return false end
+
+  -- Case-insensitive for single-byte (ASCII) characters, same as before -
+  -- :lower() can't case-fold a multi-byte accented character (see
+  -- ProperCase above), so a repeated accented letter only matches here
+  -- byte-for-byte exact, e.g. three literal "é"s in a row.
+  for i = 3, #chars do
+    local a, b, c = chars[i], chars[i - 1], chars[i - 2]
+    if #a == 1 then a = a:lower() end
+    if #b == 1 then b = b:lower() end
+    if #c == 1 then c = c:lower() end
+    if a == b and b == c then return false end
+  end
+
+  return true
+end
+ns.IsValidPlayerDbName = IsValidPlayerDbName
+
+-- Trims/lowercases input and looks it up in RealmMap, returning the
+-- proper-cased realm name or nil if it's not a realm we know about.
+local function NormalizeRealmName(input)
+  if not input then return nil end
+  input = trim(input)
+  if input == "" then return nil end
+  return RealmMap[input:lower()]
+end
+ns.NormalizeRealmName = NormalizeRealmName
+
+-- Returns array of {realm=ProperRealm, class=classFileOrNil} for a
+-- lowercase bare name - 0, 1, or many (see masterRoster's own comment in
+-- EnsureDB for why a single name can be known on more than one realm).
+local function GetKnownRealmEntries(lowerName)
+  local entries = {}
+  local byRealm = MakeIdiotsAppearDB.masterRoster[lowerName]
+  if byRealm then
+    for _, data in pairs(byRealm) do
+      table.insert(entries, { realm = data.realm, class = data.class })
+    end
+  end
+  return entries
+end
+ns.GetKnownRealmEntries = GetKnownRealmEntries
 
 -- Returns: normalizedString, needsRealm (bool)
 -- normalizedString is "Name-Realm" if we could resolve a realm, otherwise just "Name".
@@ -378,15 +515,15 @@ local function NormalizePlayerName(input)
   -- realms - an unrecognized/misspelled realm (e.g. "-Aztiesh") falls through
   -- to the masterRoster lookup below just like a missing realm would, rather
   -- than being accepted as-is via ProperCase.
-  local resolvedRealm = nil
-  if realmPart then
-    realmPart = trim(realmPart)
-    resolvedRealm = RealmMap[realmPart:lower()]
-  end
+  local resolvedRealm = realmPart and NormalizeRealmName(realmPart) or nil
   if not resolvedRealm then
-    local known = MakeIdiotsAppearDB.masterRoster[namePart:lower()]
-    if known then
-      resolvedRealm = known
+    -- Only auto-resolve a bare name when it's known on exactly one realm -
+    -- if it's known on two or more, there's no way to guess which one was
+    -- meant, so this falls through to "needs realm" just like a completely
+    -- unknown name would.
+    local known = GetKnownRealmEntries(namePart:lower())
+    if #known == 1 then
+      resolvedRealm = known[1].realm
     end
   end
 
@@ -461,12 +598,67 @@ local function GetFullUnitName(unit)
 end
 ns.GetFullUnitName = GetFullUnitName
 
+-- Adds or updates one masterRoster entry, identified by name+realm (both
+-- expected to already be resolved/proper-cased by the caller - this is the
+-- single write path, not a validator). class: a class file token sets it,
+-- false explicitly clears it, nil (omitted) leaves whatever's already there
+-- untouched - lets RecordRosterUnit below update just the realm without
+-- clobbering a previously-learned class if UnitClass can't resolve one.
+local function UpsertPlayerDbEntry(name, realm, class)
+  if not name or name == "" or not realm or realm == "" then return end
+  local lowerName, lowerRealm = name:lower(), realm:lower()
+  local byRealm = MakeIdiotsAppearDB.masterRoster[lowerName]
+  if not byRealm then
+    byRealm = {}
+    MakeIdiotsAppearDB.masterRoster[lowerName] = byRealm
+  end
+  local existing = byRealm[lowerRealm]
+  local resolvedClass
+  if class == false then
+    resolvedClass = nil
+  elseif class ~= nil then
+    resolvedClass = class
+  else
+    resolvedClass = existing and existing.class or nil
+  end
+  byRealm[lowerRealm] = { realm = realm, class = resolvedClass }
+end
+ns.UpsertPlayerDbEntry = UpsertPlayerDbEntry
+
+-- Removes one name+realm entry, cleaning up the now-empty name-level table
+-- so GetKnownRealmEntries/GetAllPlayerDbEntries never see stale empty rows.
+local function RemovePlayerDbEntry(name, realm)
+  if not name or not realm then return end
+  local lowerName = name:lower()
+  local byRealm = MakeIdiotsAppearDB.masterRoster[lowerName]
+  if not byRealm then return end
+  byRealm[realm:lower()] = nil
+  if next(byRealm) == nil then
+    MakeIdiotsAppearDB.masterRoster[lowerName] = nil
+  end
+end
+ns.RemovePlayerDbEntry = RemovePlayerDbEntry
+
+-- Flattens the whole masterRoster into {name=ProperName, realm=ProperRealm,
+-- class=classFileOrNil} rows for the Player Database window.
+local function GetAllPlayerDbEntries()
+  local rows = {}
+  for lowerName, byRealm in pairs(MakeIdiotsAppearDB.masterRoster) do
+    for _, data in pairs(byRealm) do
+      table.insert(rows, { name = ProperCase(lowerName), realm = data.realm, class = data.class })
+    end
+  end
+  return rows
+end
+ns.GetAllPlayerDbEntries = GetAllPlayerDbEntries
+
 local function RecordRosterUnit(unit)
   local full = GetFullUnitName(unit)
   if not full then return end
   local name, realm = full:match("^(.-)%-(.+)$")
   if name and realm then
-    MakeIdiotsAppearDB.masterRoster[name:lower()] = realm
+    local _, classFile = UnitClass(unit)
+    UpsertPlayerDbEntry(name, realm, classFile)
   end
 end
 
@@ -653,6 +845,33 @@ local function GetClassColor(classFile)
 end
 ns.GetClassColor = GetClassColor
 
+-- Returns (list, order) for an AceGUI Dropdown's SetList(list, order):
+-- list[classFile] = localized display name, order = classFiles in display
+-- order. CLASS_SORT_ORDER is a Blizzard global giving the client's actual
+-- canonical class order; RAID_CLASS_COLORS (also a Blizzard global, keyed
+-- by class file token) is the fallback source of the token set itself if
+-- that's ever missing. Either way this reflects whatever class set the
+-- running client actually has - nothing here is hardcoded per-expansion.
+local function GetClassList()
+  local list, order = {}, {}
+  local tokens = CLASS_SORT_ORDER
+  if not tokens then
+    tokens = {}
+    for token in pairs(RAID_CLASS_COLORS or {}) do
+      table.insert(tokens, token)
+    end
+    table.sort(tokens)
+  end
+  for _, token in ipairs(tokens) do
+    if RAID_CLASS_COLORS and RAID_CLASS_COLORS[token] then
+      list[token] = (LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[token]) or token
+      table.insert(order, token)
+    end
+  end
+  return list, order
+end
+ns.GetClassList = GetClassList
+
 ----------------------------------------------------------------------
 -- Invite engine
 ----------------------------------------------------------------------
@@ -784,9 +1003,15 @@ end
 -- bounces off the game's own party-full response).
 local function InvitePlayerManually(fullName)
   if not fullName:find("%-") then
-    local resolved = MakeIdiotsAppearDB.masterRoster[fullName:lower()]
-    if resolved then
-      fullName = fullName .. "-" .. resolved
+    local known = GetKnownRealmEntries(fullName:lower())
+    if #known == 1 then
+      fullName = fullName .. "-" .. known[1].realm
+    elseif #known > 1 then
+      local realms = {}
+      for _, entry in ipairs(known) do table.insert(realms, entry.realm) end
+      print(PREFIX .. "Multiple realms known for " .. fullName .. " (" .. table.concat(realms, ", ") ..
+        ") - specify which one, e.g. " .. fullName .. "-" .. known[1].realm .. ".")
+      return
     else
       print(PREFIX .. "Can't invite " .. fullName .. " - no realm on file yet. Add manually later.")
       return
@@ -1069,9 +1294,16 @@ RunInvitePass = function()
     local nextName = table.remove(Engine.queue, 1)
 
     if not nextName:find("%-") then
-      local resolved = MakeIdiotsAppearDB.masterRoster[nextName:lower()]
-      if resolved then
-        nextName = nextName .. "-" .. resolved
+      local known = GetKnownRealmEntries(nextName:lower())
+      if #known == 1 then
+        nextName = nextName .. "-" .. known[1].realm
+      elseif #known > 1 then
+        local realms = {}
+        for _, entry in ipairs(known) do table.insert(realms, entry.realm) end
+        print(PREFIX .. "Skipping " .. nextName .. " - multiple realms known (" .. table.concat(realms, ", ") ..
+          ") - specify which one, e.g. " .. nextName .. "-" .. known[1].realm .. ".")
+        table.insert(Engine.skipped, nextName)
+        nextName = nil
       else
         print(PREFIX .. "Skipping " .. nextName .. " - no realm on file yet. Add manually later.")
         table.insert(Engine.skipped, nextName)

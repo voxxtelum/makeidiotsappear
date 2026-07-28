@@ -3,6 +3,7 @@
     <Script file="GroupComps.lua"/>
     <Script file="UI_Settings.lua"/>
     <Script file="UI_Rosters.lua"/>
+    <Script file="UI_PlayerDB.lua"/>
     <Script file="UI_Groups.lua"/>
     <Script file="UI_Main.lua"/>
 </Ui>
