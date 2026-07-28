@@ -224,6 +224,20 @@ local function CreateEngineStatusGrid(parent, x, y, colGap, button)
     countdownCell:SetText(text)
   end
 
+  -- These cells are raw FontStrings on `parent`, not AceGUI children (see
+  -- this function's own comment above) - callers whose `parent` is itself
+  -- an AceGUI widget that can be released and recycled (unlike
+  -- collapsedFrame, a plain persistent frame) need to call this from that
+  -- widget's own OnRelease, or these stay permanently parented and visible
+  -- on whatever that recycled widget becomes next.
+  function grid:Hide()
+    countdownCell:Hide()
+    cell12:Hide()
+    cell21:Hide()
+    cell22:Hide()
+    stateCell:Hide()
+  end
+
   return grid
 end
 
@@ -1123,6 +1137,27 @@ local function BuildMainFrame()
   -- so a 0,0 margin rendered text outside the visible box on those two
   -- sides. 4/-6 clears both with a little room to spare.
   engineStatusGrid = CreateEngineStatusGrid(statusGroup.content, 8, -6, 140, startBtn)
+
+  -- statusGroup is an AceGUI "InlineGroup" - the same recycled-by-type
+  -- widget UI_Rosters.lua's leftGroup/rightGroup (and other windows' own
+  -- panels) also use, and statusBorder/statusGroup.content above are the
+  -- SAME raw frames for the life of this widget object, not recreated on
+  -- reacquire. Without resetting them here, whichever other window's panel
+  -- this exact frame gets recycled into next would inherit these custom,
+  -- title-bar-less anchors instead of InlineGroup's own defaults, making
+  -- its content visually overlap its own title - and engineStatusGrid's raw
+  -- FontStrings (see its own comment) would stay permanently parented and
+  -- visible on it too. mainFrame's own OnClose releases statusGroup as part
+  -- of releasing the whole frame tree, which is what triggers this.
+  statusGroup.OnRelease = function(self)
+    statusBorder:ClearAllPoints()
+    statusBorder:SetPoint("TOPLEFT", 0, -17)
+    statusBorder:SetPoint("BOTTOMRIGHT", -1, 3)
+    self.content:ClearAllPoints()
+    self.content:SetPoint("TOPLEFT", 10, -10)
+    self.content:SetPoint("BOTTOMRIGHT", -10, 10)
+    engineStatusGrid:Hide()
+  end
 
   -- Re-seeded (not appended) since BuildMainFrame can run more than once per
   -- session - ToggleMainFrame/OnClose already tear mainFrame down and
