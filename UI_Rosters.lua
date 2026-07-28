@@ -467,20 +467,35 @@ local function BuildRosterManagerFrame()
   -- ClearFocus() before SaveRoster() (not after) is what stops the plain
   -- newline that would otherwise still get inserted once this handler
   -- returns - same trick other "Enter submits" multi-line boxes use.
-  playersBox.editBox:HookScript("OnKeyDown", function(self, key)
-    if key == "ENTER" and IsControlKeyDown() then
-      self:ClearFocus()
-      -- The engine still inserts Enter's default newline into this
-      -- multi-line box after this handler returns, regardless of
-      -- ClearFocus() above - landing at position 0 specifically because
-      -- AceGUI's SetText always resets the cursor there (see OnTextSet in
-      -- AceGUIWidget-MultiLineEditBox.lua). Deferring SaveRoster (which
-      -- rewrites the box via SetText) by one frame, instead of calling it
-      -- inline here, lets our authoritative text land *after* that stray
-      -- insertion so it overwrites it rather than racing it.
-      C_Timer.After(0, SaveRoster)
-    end
-  end)
+  -- AceGUI recycles MultiLineEditBox widgets by type, and this window is
+  -- fully released and rebuilt fresh every time it's reopened (see
+  -- ShowRosterManagerFrame) - so playersBox.editBox can be the very same
+  -- underlying widget from a previous open. HookScript can't be replaced or
+  -- removed, so without this guard, reopening this window would stack
+  -- another OnKeyDown hook onto that same recycled editbox every time,
+  -- and Ctrl+Enter would fire all of them at once (one SaveRoster call, and
+  -- one "Saved roster..." print, per past open this session).
+  if not playersBox.editBox.miaCtrlEnterHooked then
+    playersBox.editBox.miaCtrlEnterHooked = true
+    playersBox.editBox:HookScript("OnKeyDown", function(self, key)
+      if key == "ENTER" and IsControlKeyDown() then
+        self:ClearFocus()
+        -- The engine still inserts Enter's default newline into this
+        -- multi-line box after this handler returns, regardless of
+        -- ClearFocus() above - landing at position 0 specifically because
+        -- AceGUI's SetText always resets the cursor there (see OnTextSet in
+        -- AceGUIWidget-MultiLineEditBox.lua). Deferring SaveRoster (which
+        -- rewrites the box via SetText) by one frame, instead of calling it
+        -- inline here, lets our authoritative text land *after* that stray
+        -- insertion so it overwrites it rather than racing it. SaveRoster
+        -- itself is a shared upvalue reassigned on every rebuild (see its
+        -- own declaration above), so even though this hook is only
+        -- installed once per underlying widget, it always calls whichever
+        -- version is current when it actually fires, not a stale one.
+        C_Timer.After(0, SaveRoster)
+      end
+    end)
+  end
 
   -- Pushes Save Roster/Set Active down those extra few px so they line up
   -- with Add Roster/Delete Roster on the left (see leftSpacer above).
