@@ -55,7 +55,7 @@ local ACTIVE_STATUS_SORT_RANK = {
 }
 
 local mainFrame = nil
-local leftGroup, playerScroll, engineStatusGrid, startBtn
+local leftGroup, playerScroll, headerRow, engineStatusGrid, startBtn
 local lootThresholdBtn, lootThresholdDropdown, disbandBtn
 local benchLabel, benchScroll
 
@@ -435,6 +435,25 @@ local function CreateBlankSeparatorRow()
   return row
 end
 
+-- headerRow's width is set to match playerScroll.content's own current
+-- width (see BuildMainFrame's own comment on headerRow for why they need to
+-- match) - but playerScroll's scrollbar only actually shows/hides (and its
+-- content only actually narrows/widens by the 20px that costs it) on the
+-- frame *after* new rows are laid out (see
+-- AceGUIContainer-ScrollFrame.lua's FixScroll, deferred via an OnUpdate
+-- script), so reading playerScroll.content's width synchronously right
+-- after a refresh can still reflect its state from before this refresh's
+-- row count changed it. Deferred by one frame so this always reads the
+-- settled value - matters both for a roster that just crossed the
+-- scrollbar's need-one/don't-need-one threshold, and for the very first
+-- refresh after BuildMainFrame, where headerRow only has a same-guess
+-- starting width until this runs once.
+local function SyncHeaderRowWidth()
+  if not headerRow or not playerScroll then return end
+  headerRow:SetWidth(playerScroll.content:GetWidth())
+  headerRow:DoLayout()
+end
+
 local function RefreshPlayerList()
   -- AceGUI's ScrollFrame recalculates its scroll offset as content is torn
   -- down and rebuilt below, which tends to snap it back toward the top.
@@ -555,6 +574,7 @@ local function RefreshPlayerList()
 
   playerScroll:DoLayout()
   playerScroll:SetScroll(savedScroll)
+  C_Timer.After(0, SyncHeaderRowWidth)
 
   -- Always released/rebuilt (not just when shown) so no stale rows are left
   -- sitting around invisibly if the bench empties out next refresh. Same
@@ -892,9 +912,24 @@ local function BuildMainFrame()
     leftGroup.titletext:SetFont(fontFile, 11, fontFlags)
   end
 
-  local headerRow = AceGUI:Create("SimpleGroup")
+  headerRow = AceGUI:Create("SimpleGroup")
   headerRow:SetLayout("Flow")
-  headerRow:SetFullWidth(true)
+  -- Deliberately not SetFullWidth(true). The player list below lives inside
+  -- playerScroll, a ScrollFrame whose content area narrows by a fixed 20px
+  -- whenever its scrollbar is actually shown (see
+  -- AceGUIContainer-ScrollFrame.lua's FixScroll,
+  -- SetPoint("BOTTOMRIGHT", -20, 0)) and is full width otherwise - this
+  -- header row's Name/Status cells are relative-width, computed against
+  -- whatever container they sit in, so they only stay aligned with the rows
+  -- below if this row's own width tracks playerScroll.content's width
+  -- exactly, in *either* state, not just assumed-scrollbar-shown. This is
+  -- just a same-guess starting width (leftGroup.content's width minus the
+  -- 20px scrollbar gutter, on the assumption most rosters overflow the
+  -- list) - SyncHeaderRowWidth (see RefreshPlayerList) corrects it for real
+  -- moments after, once playerScroll's own width has actually settled, and
+  -- keeps re-syncing it on every future refresh as the roster's size (and
+  -- so whether the scrollbar shows at all) changes.
+  headerRow:SetWidth(leftGroup.content:GetWidth() - 20)
   headerRow:SetHeight(28)
 
   -- Drops a Label from GameFontHighlightMedium to the same chat font used
