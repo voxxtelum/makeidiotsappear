@@ -66,6 +66,10 @@ local ROW_RELWIDTHS = { name = 0.28, realm = 0.28, class = 0.24, action = 0.10 }
 -- shift every row below it up or down in the list.
 local ROW_HEIGHT = 26
 
+-- Taller than a data row so the header visually reads as its own row rather
+-- than blending into the list.
+local HEADER_ROW_HEIGHT = 34
+
 -- Plain native icon button (no AceGUI widget), same technique as
 -- UI_Main.lua's own CreateIconButton (used there for the collapse/expand
 -- buttons and the bench row's invite button) - AceGUI's own Button widget
@@ -279,57 +283,27 @@ local function RowMatchesSearch(row, needle)
     or class:find(needle, 1, true) ~= nil
 end
 
--- Same background technique as UI_Main.lua's own player list (PrepareRow) -
--- a plain BACKGROUND-layer texture, black at 0.5 alpha (bumped up from that
--- list's own 0.18 - this window's tooltip-style backdrop reads darker, so
--- the lighter value was too faint to see against it) - reused here for
--- visual consistency with the rest of the addon otherwise. Cached on the
--- frame itself (rather than created fresh every render) and just
--- shown/hidden after that, same as PrepareRow's own riRowBg - this exact
--- raw frame is very likely to get reused across this window's own
--- re-renders (AceGUI recycles "SimpleGroup" widgets by type - see
--- FinalizeRow's own comment below), so this avoids piling up a fresh
--- throwaway texture on it every single time.
-local function ApplyRowBackground(frame, show)
-  if not frame.miaRowBg then
-    local bg = frame:CreateTexture(nil, "BACKGROUND")
-    bg:SetAllPoints(frame)
-    if bg.SetColorTexture then
-      bg:SetColorTexture(0, 0, 0, 0.5)
-    else
-      bg:SetTexture(1, 1, 1, 1)
-      bg:SetVertexColor(0, 0, 0, 0.5)
-    end
-    frame.miaRowBg = bg
-  end
-  frame.miaRowBg:SetShown(show)
-end
-
 -- Parents a native remove icon directly onto rowGroup.frame (not added via
--- :AddChild - see ROW_RELWIDTHS' own comment for why), applies the striped
--- background above, and wires up cleanup for both so neither can leak into
--- some other window's SimpleGroup later. AceGUI recycles "SimpleGroup"
--- widgets by type across this entire addon (every row here is a fresh one
--- each render - see RenderRows/CreateRow), and HookScript-free plain child
--- frames/textures parented this way aren't reachable through AceGUI's own
--- ReleaseChildren, so without this they'd still be sitting there the next
--- time this exact recycled frame gets handed out as some unrelated
--- row/spacer/button elsewhere - same reasoning UI_Main.lua's CreateBenchRow
--- documents for its own bench-row invite button.
+-- :AddChild - see ROW_RELWIDTHS' own comment for why), and wires up cleanup
+-- so it can't leak into some other window's SimpleGroup later. AceGUI
+-- recycles "SimpleGroup" widgets by type across this entire addon (every
+-- row here is a fresh one each render - see RenderRows/CreateRow), and
+-- HookScript-free plain child frames parented this way aren't reachable
+-- through AceGUI's own ReleaseChildren, so without this it'd still be
+-- sitting there the next time this exact recycled frame gets handed out as
+-- some unrelated row/spacer/button elsewhere - same reasoning UI_Main.lua's
+-- CreateBenchRow documents for its own bench-row invite button.
 --
 -- actionBtn is the row's own Edit/Save button, already added - anchoring the
 -- remove icon to its frame (rather than the row's own right edge) is what
 -- keeps it sitting right next to it instead of out at the row's full width,
--- since ROW_RELWIDTHS.action only fills a fraction of that width. isEven
--- controls the striped background - see RenderRows for how it's computed.
-local function FinalizeRow(rowGroup, row, actionBtn, isEven)
+-- since ROW_RELWIDTHS.action only fills a fraction of that width.
+local function FinalizeRow(rowGroup, row, actionBtn)
   local removeBtn = CreateRemoveButton(rowGroup.frame, function()
     RemoveRow(row)
   end)
   removeBtn:SetPoint("LEFT", actionBtn.frame, "RIGHT", 6, 0)
   rowGroup.frame.miaRemoveBtn = removeBtn
-
-  ApplyRowBackground(rowGroup.frame, isEven)
 
   -- Nil-checked because this same widget can later be handed out to a
   -- totally different window (AceGUI recycles "SimpleGroup" by type
@@ -343,13 +317,32 @@ local function FinalizeRow(rowGroup, row, actionBtn, isEven)
       self.frame.miaRemoveBtn:SetParent(UIParent)
       self.frame.miaRemoveBtn = nil
     end
-    if self.frame.miaRowBg then
-      self.frame.miaRowBg:Hide()
-    end
   end
 end
 
-local function CreateEditRow(row, isEven)
+-- Corrects a mismatch found while diagnosing this row's vertical alignment:
+-- AceGUI's Flow layout is supposed to anchor a row's first child with a
+-- plain, zero-offset frame:SetPoint("TOPLEFT", content) - but at runtime
+-- that widget was consistently rendering 3px lower than the row itself
+-- (confirmed via GetPoint(), which showed an explicit yOfs=-3 that doesn't
+-- exist anywhere in this addon's own code, or in the vendored Flow layout
+-- function in this addon's own Libs folder). Almost certainly a different,
+-- likely newer copy of AceGUI-3.0 than the one vendored here is the one
+-- actually executing - WoW addons all share a single AceGUI-3.0 instance
+-- addon-wide via LibStub, so another addon's embedded copy can end up being
+-- the version that wins, with its own different first-child behavior.
+-- Rather than depend on identifying exactly which copy that is, this just
+-- re-anchors the row's first child directly to the row's own content with
+-- a real zero offset once Flow has finished laying everything out - every
+-- other child in the row is anchored relative to this same first child
+-- (not to content directly - see Flow's own positioning math), so
+-- correcting it cascades the fix through the rest of the row automatically.
+local function FixFirstChildTopAnchor(rowGroup, firstChild)
+  firstChild.frame:ClearAllPoints()
+  firstChild.frame:SetPoint("TOPLEFT", rowGroup.content, "TOPLEFT", 0, 0)
+end
+
+local function CreateEditRow(row)
   local rowGroup = AceGUI:Create("SimpleGroup")
   rowGroup:SetLayout("Flow")
   rowGroup:SetFullWidth(true)
@@ -386,18 +379,28 @@ local function CreateEditRow(row, isEven)
   local saveBtn = AceGUI:Create("Button")
   saveBtn:SetText("Save")
   saveBtn:SetRelativeWidth(ROW_RELWIDTHS.action)
+  -- AceGUI's Button widget defaults to a natural height of 24px, unlike
+  -- every other child in this row (EditBox/Dropdown/padded Label all sit at
+  -- ROW_HEIGHT=26) - Flow layout positions each child relative to the
+  -- previous one based on half its own natural height unless told
+  -- otherwise, so that mismatch alone is enough to throw this button's
+  -- vertical position off from everything else in the row. Matching heights
+  -- lets Flow's own centering math line them all up consistently instead of
+  -- fighting it.
+  saveBtn:SetHeight(ROW_HEIGHT)
   ns.ShrinkButtonFont(saveBtn)
   saveBtn:SetCallback("OnClick", function()
     SaveRow(row)
   end)
   rowGroup:AddChild(saveBtn)
 
-  FinalizeRow(rowGroup, row, saveBtn, isEven)
+  FixFirstChildTopAnchor(rowGroup, nameBox)
+  FinalizeRow(rowGroup, row, saveBtn)
 
   return rowGroup
 end
 
-local function CreateDisplayRow(row, isEven)
+local function CreateDisplayRow(row)
   local rowGroup = AceGUI:Create("SimpleGroup")
   rowGroup:SetLayout("Flow")
   rowGroup:SetFullWidth(true)
@@ -428,22 +431,26 @@ local function CreateDisplayRow(row, isEven)
   local editBtn = AceGUI:Create("Button")
   editBtn:SetText("Edit")
   editBtn:SetRelativeWidth(ROW_RELWIDTHS.action)
+  -- See saveBtn's own comment in CreateEditRow above - same fix, same
+  -- reason (AceGUI Button's 24px default height vs this row's 26px).
+  editBtn:SetHeight(ROW_HEIGHT)
   ns.ShrinkButtonFont(editBtn)
   editBtn:SetCallback("OnClick", function()
     StartEditingRow(row)
   end)
   rowGroup:AddChild(editBtn)
 
-  FinalizeRow(rowGroup, row, editBtn, isEven)
+  FixFirstChildTopAnchor(rowGroup, nameLabel)
+  FinalizeRow(rowGroup, row, editBtn)
 
   return rowGroup
 end
 
-local function CreateRow(row, isEven)
+local function CreateRow(row)
   if row.editing then
-    return CreateEditRow(row, isEven)
+    return CreateEditRow(row)
   end
-  return CreateDisplayRow(row, isEven)
+  return CreateDisplayRow(row)
 end
 
 -- Below 3 characters, the search box doesn't filter at all (matches
@@ -472,15 +479,9 @@ RenderRows = function()
   local savedScroll = scroll.localstatus and scroll.localstatus.scrollvalue or 0
 
   scroll:ReleaseChildren()
-  -- Counts only rows actually being shown, not each row's position in the
-  -- underlying (possibly filtered-down) data - so the striping still comes
-  -- out as a clean alternating pattern based on what's actually on screen,
-  -- rather than having gaps in it wherever a filtered-out row would've sat.
-  local visibleCount = 0
   for _, row in ipairs(workingRows) do
     if not filtering or RowMatchesSearch(row, needle) then
-      visibleCount = visibleCount + 1
-      scroll:AddChild(CreateRow(row, visibleCount % 2 == 0))
+      scroll:AddChild(CreateRow(row))
     end
   end
 
@@ -535,11 +536,13 @@ local function BuildPlayerDbFrame()
   -- AceGUI's Frame widget anchors its "Close" button to the window's own
   -- BOTTOMRIGHT (see AceGUIContainer-Frame.lua's Constructor), not inside
   -- the scrollable content area - so the content stack (toolbar + search box
-  -- + header + scroll, ~514px) needs real clearance below it or the scroll
-  -- area overlaps that button. 620 leaves ~60px of margin below the content
-  -- - confirmed enough to clear the Close button without excess empty space.
+  -- + header + scroll) needs real clearance below it or the scroll area
+  -- overlaps that button. 636 keeps the same ~60px margin below the content
+  -- that 620 gave it before the header row grew taller (see
+  -- HEADER_ROW_HEIGHT) - confirmed enough to clear the Close button without
+  -- excess empty space.
   f:SetWidth(620)
-  f:SetHeight(620)
+  f:SetHeight(636)
   f:SetCallback("OnClose", function(widget)
     AceGUI:Release(widget)
     playerDbFrame = nil
@@ -649,28 +652,33 @@ local function BuildPlayerDbFrame()
   -- own narrowed width means giving the header that same 586 - 20 = 566px
   -- instead.
   headerRow:SetWidth(566)
+  headerRow.noAutoHeight = true
+  headerRow:SetHeight(HEADER_ROW_HEIGHT)
   f:AddChild(headerRow)
 
-  ApplyRowBackground(headerRow.frame, true)
-  headerRow.OnRelease = function(self)
-    if self.frame.miaRowBg then
-      self.frame.miaRowBg:Hide()
-    end
-  end
+  -- Gold, matching the same color used for labels/headers throughout the
+  -- rest of the addon (e.g. UI_Main.lua's benchLabel, EditBox labels).
+  local HEADER_TEXT_COLOR = { 1, 0.82, 0 }
 
   local nameHeader = AceGUI:Create("Label")
   nameHeader:SetRelativeWidth(ROW_RELWIDTHS.name)
   nameHeader:SetText("Name")
+  ns.PadLabelVertically(nameHeader, HEADER_ROW_HEIGHT)
+  nameHeader:SetColor(unpack(HEADER_TEXT_COLOR))
   headerRow:AddChild(nameHeader)
 
   local realmHeader = AceGUI:Create("Label")
   realmHeader:SetRelativeWidth(ROW_RELWIDTHS.realm)
   realmHeader:SetText("Realm")
+  ns.PadLabelVertically(realmHeader, HEADER_ROW_HEIGHT)
+  realmHeader:SetColor(unpack(HEADER_TEXT_COLOR))
   headerRow:AddChild(realmHeader)
 
   local classHeader = AceGUI:Create("Label")
   classHeader:SetRelativeWidth(ROW_RELWIDTHS.class)
   classHeader:SetText("Class")
+  ns.PadLabelVertically(classHeader, HEADER_ROW_HEIGHT)
+  classHeader:SetColor(unpack(HEADER_TEXT_COLOR))
   headerRow:AddChild(classHeader)
 
   local actionHeader = AceGUI:Create("Label")
