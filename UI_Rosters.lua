@@ -254,7 +254,6 @@ end
 local function BuildRosterManagerFrame()
   local f = AceGUI:Create("Frame")
   ns.ApplyTooltipWindowStyle(f)
-  ns.CloseWindowOnEscape(f)
   f:SetTitle("Manage Rosters")
   f:SetStatusText("")
   f:SetLayout("Flow")

@@ -420,7 +420,6 @@ local function BuildSettingsFrame()
 
   local f = AceGUI:Create("Frame")
   ns.ApplyTooltipWindowStyle(f)
-  ns.CloseWindowOnEscape(f)
   f:SetTitle("Make Idiots Appear Settings")
   f:SetStatusText("")
   f:SetLayout("Flow")

@@ -255,7 +255,6 @@ end
 local function BuildPlayerDbFrame()
   local f = AceGUI:Create("Frame")
   ns.ApplyTooltipWindowStyle(f)
-  ns.CloseWindowOnEscape(f)
   f:SetTitle("Player Database")
   f:SetStatusText("")
   f:SetLayout("Flow")

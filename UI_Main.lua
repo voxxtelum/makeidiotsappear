@@ -770,12 +770,6 @@ end
 local function BuildMainFrame()
   local frame = AceGUI:Create("Frame")
   ns.ApplyTooltipWindowStyle(frame)
-  -- Unlike every other window in this addon, the main window should never
-  -- close on Escape - but AceGUI:Create("Frame") can hand back a raw frame
-  -- previously used (and released) by one of those other windows, which
-  -- would have left it opted in. See ns.CloseWindowOnEscape/
-  -- ns.DisableWindowEscapeClose in MakeIdiotsAppear.lua for why.
-  ns.DisableWindowEscapeClose(frame)
   -- Version suffix dropped from the title to leave room for collapseBtn in
   -- the top-right corner (see below) - re-add a title repositioning fix
   -- instead if the shorter title still overlaps it.
