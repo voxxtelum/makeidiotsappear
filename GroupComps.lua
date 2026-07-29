@@ -2,31 +2,17 @@
 -- Per-roster raid group compositions: data model + apply-to-raid engine.
 --
 -- A roster can have several named "compositions", each arranging up to 40
--- of its players into 8 groups of 5. The "unassigned" pool (players on the
--- roster not currently placed in any group) is never stored - it's always
--- computed live from the roster list vs. a composition's groups, see
--- ComputeUnassigned below.
+-- players into 8 groups of 5. The unassigned pool is never stored - it's
+-- computed live as roster minus placed players (see ComputeUnassigned).
 --
--- One composition, "Default", is special only in that it's the one
--- EnsureRosterGroupData seeds automatically (chunked from the roster's
--- player-list order) the first time a roster is saved/seen with at least one
--- player and every one of them has a fully resolved "Name-Realm" entry (see
--- AllNamesResolved) - a roster saved with any still-unresolved names is left
--- unseeded until a later save resolves them all. After that it's just an
--- ordinary composition - roster saves in UI_Rosters.lua no longer touch it,
--- so manual rearranging of Default sticks across roster edits the same as
--- any other named composition.
+-- "Default" is auto-seeded once (see EnsureRosterGroupData) the first time a
+-- roster is saved with players that all have resolved realms; after that
+-- it's an ordinary composition and edits stick.
 --
--- Each group (comp.groups[1..8]) is a fixed 5-slot table, addressed by
--- explicit position 1-5 rather than compacted/appended - an empty slot is
--- simply a nil at that position, not a hole that gets squeezed out. This
--- means position within a group is meaningful and preserved (matters both
--- for the UI - dragging someone out of slot 3 leaves slot 3 blank, doesn't
--- shuffle slots 4-5 up - and for ApplyGroupComposition, which uses the same
--- slot index as the target position to place someone at in the live raid).
--- Because of the nil holes, every place that reads a group's contents must
--- index it by explicit position (for p = 1, SLOTS_PER_GROUP do ... end),
--- never ipairs/# (both are undefined/unreliable once holes are involved).
+-- Each group is a fixed 5-slot table addressed by explicit position, not
+-- compacted - an empty slot is a nil at that position, so every reader must
+-- index by position (never ipairs/#), and ApplyGroupComposition relies on
+-- slot index matching the target raid position.
 
 local ADDON_NAME, ns = ...
 local PREFIX = ns.PREFIX
@@ -63,10 +49,8 @@ local function ChunkListIntoGroups(list)
 end
 ns.ChunkListIntoGroups = ChunkListIntoGroups
 
--- Per NormalizePlayerName's own contract (MakeIdiotsAppear.lua): a resolved
--- entry is always stored as "Name-Realm", an unresolved one as just "Name" -
--- so a missing dash reliably means "still needs a realm" without redoing any
--- normalization work here.
+-- A resolved name is always stored as "Name-Realm" (see NormalizePlayerName
+-- in MakeIdiotsAppear.lua); an unresolved one is just "Name" with no dash.
 local function AllNamesResolved(rosterList)
   for _, name in ipairs(rosterList) do
     if not name:find("%-") then return false end
@@ -94,20 +78,11 @@ local function GenerateUniqueCompName(rosterGroupData, base)
   return base .. " " .. i
 end
 
--- Get-or-create the roster's group data, seeding a "Default" composition
--- (chunked from rosterList's current order) the first time this roster is
--- saved/seen with at least one player and every entry has a resolved
--- "Name-Realm" (see AllNamesResolved). Deliberately does NOT seed Default
--- from an empty or still-unresolved rosterList - EnsureRosterGroupData only
--- seeds once (see below), so seeding it prematurely (e.g. from
--- GetActiveGroupComp being called to just display a still-empty roster's
--- Groups window, from a roster's very first save before any players are
--- typed, or from a save that still has an unresolved name in it) would
--- permanently lock in a wrong/incomplete Default: a later save with a fully
--- resolved list would find a comp already there and skip reseeding, leaving
--- players stuck in "unassigned" instead of chunked into groups. Once seeded,
--- Default is never auto-regenerated - manual rearranging of it sticks across
--- roster edits the same as any other named composition.
+-- Get-or-create the roster's group data, seeding "Default" (chunked from
+-- rosterList) the first time it's saved with players and every name is
+-- resolved. Seeding is skipped for an empty or unresolved list so an empty/
+-- wrong Default doesn't get permanently locked in before a real one can be
+-- seeded later.
 function ns.EnsureRosterGroupData(rosterName, rosterList)
   ns.EnsureDB()
   local data = MakeIdiotsAppearDB.groupComps[rosterName]
@@ -122,15 +97,10 @@ function ns.EnsureRosterGroupData(rosterName, rosterList)
   return data
 end
 
--- Resolves the roster's active composition, self-healing to the first
--- composition on the list if the activeComp pointer is stale (e.g. that
--- comp was renamed/deleted through some other path). Callers can always
--- assume a non-nil comp back: if the roster has no players saved yet (so
--- EnsureRosterGroupData hasn't seeded a real Default - see above), this
--- hands back a transient empty stand-in that mirrors what Default will look
--- like once seeded for real, without inserting it into data.comps - so it
--- doesn't count as "already seeded" and a real Default still gets created
--- the first time the roster is actually saved with players.
+-- Resolves the active composition, self-healing to the first comp if
+-- activeComp is stale. Always returns non-nil: if Default hasn't been
+-- seeded yet, hands back a transient empty stand-in without inserting it,
+-- so a real Default can still seed later.
 function ns.GetActiveGroupComp(rosterName)
   local rosterList = MakeIdiotsAppearDB.rosters[rosterName] or {}
   local data = ns.EnsureRosterGroupData(rosterName, rosterList)
@@ -152,10 +122,8 @@ function ns.SetActiveGroupComp(rosterName, compName)
   end
 end
 
--- The new comp starts pre-arranged in the roster's current order (same
--- chunking Default gets seeded with), not blank - matches "New" being a
--- fresh starting point you then tweak, rather than an empty grid you have to
--- fill from scratch. Returns the final (possibly de-duplicated) name.
+-- Starts pre-arranged in the roster's current order, not blank. Returns the
+-- final (possibly de-duplicated) name.
 function ns.AddGroupComp(rosterName, name)
   local data = ns.EnsureRosterGroupData(rosterName, MakeIdiotsAppearDB.rosters[rosterName] or {})
   name = ns.Trim(name or "")
@@ -185,8 +153,7 @@ function ns.RenameGroupComp(rosterName, oldName, newName)
   return true
 end
 
--- Refuses to delete the last remaining composition for a roster - there
--- must always be at least one to view/edit/apply.
+-- Refuses to delete the last composition - a roster must always have one.
 function ns.DeleteGroupComp(rosterName, compName)
   local data = ns.EnsureRosterGroupData(rosterName, MakeIdiotsAppearDB.rosters[rosterName] or {})
   if #data.comps <= 1 then return false end
@@ -214,10 +181,8 @@ function ns.DeleteRosterGroupData(rosterName)
   MakeIdiotsAppearDB.groupComps[rosterName] = nil
 end
 
--- Names from rosterList not currently placed in any of comp's 8 groups, in
--- roster order. Names placed in comp.groups that are no longer part of the
--- roster just never show up here - nothing needs to actively clean those
--- out of comp.groups itself.
+-- Roster names not currently placed in any of comp's groups, in roster
+-- order. Placed names no longer on the roster just don't show up here.
 function ns.ComputeUnassigned(rosterList, comp)
   local placed = {}
   for i = 1, GROUPS_PER_COMP do
@@ -240,18 +205,15 @@ end
 ----------------------------------------------------------------------
 -- Apply-to-raid engine
 ----------------------------------------------------------------------
--- Ported from MRT's RaidGroups.lua (ApplyGroups/ProcessRoster): moves and
--- reorders live raid members to match a composition, a few members at a
--- time, converging over several GROUP_ROSTER_UPDATE events rather than all
--- at once (each Set/SwapRaidSubgroup call only takes effect after a server
--- round-trip). Runs in three phases per composition: (1) move anyone into
--- their target group where there's room, (2) swap group membership for
--- whoever's still stuck, (3) once everyone's in the right group, reorder
--- position within each group. Phase 3 can't swap two members of the same
--- group directly (SwapRaidSubgroup only exchanges subgroup *numbers*, which
--- would be a no-op for two people already sharing one) so it routes one of
--- them out through a third "bridge" member in a different group and back -
--- a 3-step dance, same trick MRT uses.
+-- Moves and reorders live raid members to match a composition, converging
+-- over several GROUP_ROSTER_UPDATE events (each Set/SwapRaidSubgroup call
+-- only takes effect after a server round-trip). Three phases: (1) move
+-- anyone into their target group where there's room, (2) swap group
+-- membership for whoever's still stuck, (3) reorder position within each
+-- group. SwapRaidSubgroup only exchanges subgroup numbers, so two people
+-- already in the same group can't be swapped directly - phase 3 routes one
+-- of them out through a "bridge" member in a different group and back (a
+-- 3-step dance) to reorder them.
 
 local ApplyEngine = {
   pending = false,       -- true while a convergence run is in progress
@@ -259,12 +221,9 @@ local ApplyEngine = {
   needPosInGroup = nil,  -- [lowercased full name] = target position within that group
   lockedUnit = nil,      -- [lowercased full name] = true once its position swap has locked in
   groupsReady = false,   -- true once phase 1/2 (group placement) has converged
-  rlKey = nil,           -- lowercased full name of the current raid leader, if any - excluded
-                         -- from needPosInGroup entirely (see ApplyGroupComposition) and never
-                         -- picked as a bridge/swap partner in phase 3 below, since Blizzard
-                         -- always forces the raid leader into position 1 of whatever group
-                         -- they're in regardless of what anyone (even a full-lead player)
-                         -- tries to do about it.
+  rlKey = nil,           -- current raid leader's key, if any - Blizzard always forces them
+                         -- into position 1 of their group, so they're excluded from
+                         -- needPosInGroup and never used as a bridge/swap partner.
 }
 ns.GroupApplyEngine = ApplyEngine
 
@@ -293,11 +252,8 @@ local function FindRaidLeader()
 end
 ns.FindRaidLeader = FindRaidLeader
 
--- Snapshot of who's actually in the raid right now, keyed by lowercased full
--- name: which subgroup they're in, and their position within it (assigned by
--- raid-index order, not any roster/UI order). Shared by StepApplyEngine
--- (which also needs nameToID, to actually move people) and IsGroupCompInOrder
--- below (which only needs group/position, to compare against a composition).
+-- Snapshot of the live raid, keyed by lowercased full name: subgroup,
+-- position within it (by raid-index order), and nameToID for moving people.
 local function SnapshotRaidGroups()
   local currentGroup, currentPos, nameToID, groupSize = {}, {}, {}, {}
   for i = 1, GROUPS_PER_COMP do groupSize[i] = 0 end
@@ -319,26 +275,17 @@ local function SnapshotRaidGroups()
   return currentGroup, currentPos, nameToID, groupSize
 end
 
--- Builds a fresh 8x5 groups table straight from the raid's actual live
--- subgroup/position layout - the reverse direction of
--- ApplyGroupComposition, used by "Apply Current" (UI_Groups.lua) to pull the
--- raid's real arrangement back into a composition. Every current raid member
--- is placed, not just roster members - a pug filling in for someone still
--- shows up exactly where they're standing. Anyone previously in the
--- composition who isn't currently in the raid is simply absent from the
--- returned table rather than carried over - RefreshGroupsWindow's own
--- ComputeUnassignedWithExtras already treats "on the roster but not in
--- comp.groups" as unassigned, so that fallout needs no separate handling
--- here.
+-- Builds an 8x5 groups table from the raid's actual live layout - the
+-- reverse of ApplyGroupComposition, used by "Apply Current". Every raid
+-- member is placed, including pugs not on the roster; anyone not currently
+-- in the raid is simply absent, which ComputeUnassignedWithExtras already
+-- treats as unassigned.
 function ns.CaptureGroupsFromRaid()
   local currentGroup, currentPos, nameToID = SnapshotRaidGroups()
   local groups = NewEmptyGroups()
   for key, subgroup in pairs(currentGroup) do
     local pos = currentPos[key]
-    -- pos should always be 1-5 (a live subgroup can't exceed
-    -- SLOTS_PER_GROUP members) and never collide (currentPos assigns each
-    -- subgroup member a distinct slot) - both guarded anyway rather than
-    -- trusting that to stay true forever.
+    -- Guarded defensively; pos should always be 1-5 and unique per subgroup.
     if pos and pos <= SLOTS_PER_GROUP and groups[subgroup][pos] == nil then
       groups[subgroup][pos] = ns.GetFullUnitName("raid" .. nameToID[key]) or key
     end
@@ -346,9 +293,8 @@ function ns.CaptureGroupsFromRaid()
   return groups
 end
 
--- Builds the same needGroup/needPosInGroup maps ApplyGroupComposition sends
--- to the apply engine, factored out so IsGroupCompInOrder below can reuse the
--- walk over comp.groups without duplicating it.
+-- Builds needGroup/needPosInGroup from comp.groups, shared by
+-- ApplyGroupComposition and IsGroupCompInOrder.
 local function ComputeCompNeeds(comp)
   local needGroup, needPosInGroup = {}, {}
   for groupIndex = 1, GROUPS_PER_COMP do
@@ -364,32 +310,18 @@ local function ComputeCompNeeds(comp)
   return needGroup, needPosInGroup
 end
 
--- True when every player this composition places is currently in the raid at
--- exactly that group and (subject to the raid-leader exception below)
--- position - i.e. applying it right now would be a no-op. A comp entry for
--- someone not currently in the raid is ignored (same as StepApplyEngine's
--- phases 1/2 silently skipping them above - there's nothing to apply for them
--- either way), so a comp can still read as "in order" even while some of its
--- players are missing from the raid, as long as everyone who IS in the raid
--- is placed correctly.
+-- True when applying this composition right now would be a no-op: every
+-- placed player is already in the right group and (subject to two
+-- exceptions) position. Players not currently in the raid are ignored.
 --
--- Raid-leader exception: Blizzard always forces the raid leader into position
--- 1 of whatever group they're in - not even a full-lead player can reorder
--- them within a group, only move them to a different one entirely. So the
--- leader's own position is never checked here, and every other member of
--- their group is compared by *relative* order rather than absolute slot
--- number, since the leader occupying a physical slot shifts everyone else's
--- currentPos by however many slots ahead of them the leader sits.
+-- Raid-leader exception: Blizzard always forces the leader into position 1
+-- of their group, so their own position is skipped, and the rest of their
+-- group is compared by relative order instead of absolute slot.
 --
--- No-bridge exception: StepApplyEngine's phase 3 (see its own comment above)
--- can only fix a group's internal ordering by routing through a "bridge" -
--- a real raid member currently in a DIFFERENT group. If the whole raid is
--- currently crammed into a single group, no such bridge exists anywhere and
--- that group's order can never actually be fixed by Apply Groups - so rather
--- than reporting "out of order" for something clicking Apply could never
--- resolve (which just repeats the same "no one outside their group to
--- temporarily swap through" failure every time), that group's internal
--- order is skipped here too, same as the leader's own position is.
+-- No-bridge exception: phase 3 can only fix order via a bridge member in a
+-- different group. If the whole raid is in one group, no bridge exists and
+-- that group's order can never be fixed by Apply Groups, so it's exempt
+-- from the check too (otherwise it'd read "out of order" forever).
 function ns.IsGroupCompInOrder(comp)
   local needGroup, needPosInGroup = ComputeCompNeeds(comp)
   if not next(needGroup) then
@@ -426,10 +358,6 @@ function ns.IsGroupCompInOrder(comp)
       end
     end
 
-    -- No bridge exists for this group - its internal order can never be
-    -- fixed by Apply Groups (see the function comment above), so it's exempt
-    -- from the order check entirely; group placement (already checked above)
-    -- is all that matters for it.
     if hasBridge then
       table.sort(keys, function(a, b) return needPosInGroup[a] < needPosInGroup[b] end)
 
@@ -492,10 +420,9 @@ function ns.StepApplyEngine()
   local currentGroup, currentPos, nameToID, groupSize = SnapshotRaidGroups()
 
   if not ApplyEngine.groupsReady then
-    -- Phase 1: move anyone whose current group is wrong into their target
-    -- group, as long as there's room. Comp entries for players not
-    -- currently in the raid are silently skipped (currentGroup[key] is nil
-    -- for them) - nothing to move.
+    -- Phase 1: move anyone into their target group where there's room.
+    -- Players not in the raid are silently skipped (currentGroup[key] is
+    -- nil for them).
     local movedAny = false
     for key, targetGroup in pairs(needGroup) do
       local currGroup = currentGroup[key]
@@ -530,13 +457,13 @@ function ns.StepApplyEngine()
     ApplyEngine.groupsReady = true
   end
 
-  -- Phase 3: everyone's in the correct group now - fix ordering within each
-  -- group. The raid leader never has a needPosInGroup entry to begin with
-  -- (see ApplyGroupComposition - Blizzard always forces them into position 1
-  -- of whatever group they're in, no matter what anyone tries), so this loop
-  -- never attempts to reposition them; they're also excluded here from ever
-  -- being picked as someone else's bridge or swap-target, since forcing them
-  -- into a temporary slot wouldn't behave like a normal member's move would.
+  -- Phase 3: fix ordering within each group now that everyone's in the
+  -- right one. The raid leader has no needPosInGroup entry (see
+  -- ApplyGroupComposition) and is never used as a bridge/swap partner.
+  --
+  -- Only one bridge-swap dance per call, not batched: batching multiple
+  -- dances into a single pass triggered the client's "too many group
+  -- actions" throttle in practice.
   local swappedOut = {}
   local anyUnresolved = false
   local unresolvedNames = {}
@@ -571,12 +498,8 @@ function ns.StepApplyEngine()
         swappedOut[bridgeKey] = true
         return
       else
-        -- No bridge candidate exists (e.g. this group's members are the
-        -- only people currently in the raid) - reordering within it isn't
-        -- possible with the raid-subgroup API, note it and move on instead
-        -- of looping on it forever. nameToID[key] is still this same
-        -- snapshot's raid unit index, so it's safe to resolve back to a
-        -- display name synchronously here.
+        -- No bridge available (e.g. everyone's in this one group) - can't
+        -- be reordered, note it and move on.
         anyUnresolved = true
         table.insert(unresolvedNames, ns.GetFullUnitName("raid" .. nameToID[key]) or key)
       end
@@ -592,11 +515,9 @@ function ns.StepApplyEngine()
   end
 end
 
--- Called on every GROUP_ROSTER_UPDATE (see MakeIdiotsAppear.lua's
--- eventFrame) - a cheap no-op unless an apply is actually pending. Debounced
--- a beat behind the event: firing Set/SwapRaidSubgroup too rapidly back to
--- back has been reported to cause disconnects, so each new event just
--- restarts a short timer rather than stepping immediately.
+-- Runs on every GROUP_ROSTER_UPDATE; a no-op unless an apply is pending.
+-- Debounced 0.5s behind the event, since firing swaps too rapidly risks
+-- disconnects.
 function ns.OnGroupRosterUpdateForApplyEngine()
   if not ApplyEngine.pending then return end
   if stepTimer then
@@ -623,23 +544,15 @@ function ns.ApplyGroupComposition(comp)
   local rlFullName, rlGroup = FindRaidLeader()
   local rlKey = rlFullName and rlFullName:lower()
 
-  -- needPosInGroup uses the composition's own slot index (1-5) directly,
-  -- not a compacted counter - a blank slot 3 with someone in slot 4 means
-  -- position 4 is genuinely what gets requested for them, preserving
-  -- exactly how the groups were arranged in the editor.
+  -- needPosInGroup uses the comp's own slot index directly, preserving gaps
+  -- exactly as arranged.
   local needGroup, needPosInGroup = ComputeCompNeeds(comp)
 
-  -- Blizzard always forces the raid leader into position 1 of whatever group
-  -- they're in - not even a full-lead player can reorder them within a group
-  -- (see ns.IsGroupCompInOrder's matching comment). So the leader is never
-  -- given a target position of their own (phase 3 above skips anyone without
-  -- a needPosInGroup entry), and everyone else headed for the leader's group
-  -- is renumbered 2-5 by their *relative* comp order - reserving slot 1 for
-  -- the leader regardless of what raw slot number the comp actually gave
-  -- them - rather than by their raw comp slot number, which would otherwise
-  -- assume slot 1 is reachable. rlTargetGroup covers both cases the same
-  -- way: wherever the comp explicitly places the leader, or (if it doesn't)
-  -- wherever they currently already are, since nothing here will move them.
+  -- Blizzard always forces the raid leader into position 1 of their group,
+  -- so they get no needPosInGroup entry, and everyone else headed for their
+  -- group is renumbered 2-5 by relative comp order (reserving slot 1)
+  -- instead of their raw comp slot number. rlTargetGroup is wherever the
+  -- comp places the leader, or their current group if the comp doesn't.
   local rlTargetGroup = rlKey and (needGroup[rlKey] or rlGroup) or nil
   if rlTargetGroup then
     local others = {}
