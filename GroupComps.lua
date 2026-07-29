@@ -152,31 +152,18 @@ function ns.SetActiveGroupComp(rosterName, compName)
   end
 end
 
--- copyFromCompName: if given (and found), the new comp starts as a deep
--- copy of that comp's groups. Otherwise it starts pre-arranged in the
--- roster's current order (same chunking Default gets seeded with), not
--- blank - matches "New" being a fresh starting point you then tweak, rather
--- than an empty grid you have to fill from scratch. Returns the final
--- (possibly de-duplicated) name.
-function ns.AddGroupComp(rosterName, name, copyFromCompName)
+-- The new comp starts pre-arranged in the roster's current order (same
+-- chunking Default gets seeded with), not blank - matches "New" being a
+-- fresh starting point you then tweak, rather than an empty grid you have to
+-- fill from scratch. Returns the final (possibly de-duplicated) name.
+function ns.AddGroupComp(rosterName, name)
   local data = ns.EnsureRosterGroupData(rosterName, MakeIdiotsAppearDB.rosters[rosterName] or {})
   name = ns.Trim(name or "")
   if name == "" or FindComp(data, name) then
     name = GenerateUniqueCompName(data, name ~= "" and name or nil)
   end
 
-  local groups
-  local source = copyFromCompName and FindComp(data, copyFromCompName)
-  if source then
-    groups = NewEmptyGroups()
-    for i = 1, GROUPS_PER_COMP do
-      for p = 1, SLOTS_PER_GROUP do
-        groups[i][p] = source.groups[i][p]
-      end
-    end
-  else
-    groups = ChunkListIntoGroups(MakeIdiotsAppearDB.rosters[rosterName] or {})
-  end
+  local groups = ChunkListIntoGroups(MakeIdiotsAppearDB.rosters[rosterName] or {})
 
   table.insert(data.comps, { name = name, groups = groups })
   data.activeComp = name
@@ -330,6 +317,33 @@ local function SnapshotRaidGroups()
     end
   end
   return currentGroup, currentPos, nameToID, groupSize
+end
+
+-- Builds a fresh 8x5 groups table straight from the raid's actual live
+-- subgroup/position layout - the reverse direction of
+-- ApplyGroupComposition, used by "Apply Current" (UI_Groups.lua) to pull the
+-- raid's real arrangement back into a composition. Every current raid member
+-- is placed, not just roster members - a pug filling in for someone still
+-- shows up exactly where they're standing. Anyone previously in the
+-- composition who isn't currently in the raid is simply absent from the
+-- returned table rather than carried over - RefreshGroupsWindow's own
+-- ComputeUnassignedWithExtras already treats "on the roster but not in
+-- comp.groups" as unassigned, so that fallout needs no separate handling
+-- here.
+function ns.CaptureGroupsFromRaid()
+  local currentGroup, currentPos, nameToID = SnapshotRaidGroups()
+  local groups = NewEmptyGroups()
+  for key, subgroup in pairs(currentGroup) do
+    local pos = currentPos[key]
+    -- pos should always be 1-5 (a live subgroup can't exceed
+    -- SLOTS_PER_GROUP members) and never collide (currentPos assigns each
+    -- subgroup member a distinct slot) - both guarded anyway rather than
+    -- trusting that to stay true forever.
+    if pos and pos <= SLOTS_PER_GROUP and groups[subgroup][pos] == nil then
+      groups[subgroup][pos] = ns.GetFullUnitName("raid" .. nameToID[key]) or key
+    end
+  end
+  return groups
 end
 
 -- Builds the same needGroup/needPosInGroup maps ApplyGroupComposition sends

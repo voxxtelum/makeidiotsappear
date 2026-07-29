@@ -84,7 +84,7 @@ local unassignedTokenPool = {}
 local compListScroll = nil
 local newBtn = nil
 local resetBtn = nil
-local duplicateBtn = nil
+local applyCurrentBtn = nil
 local renameBtn = nil
 local deleteBtn = nil
 local applyBtn = nil
@@ -911,14 +911,17 @@ local function DoRefreshGroupsWindow()
   RefreshCompList(data)
 
   -- Comp management buttons: all disabled outright while an apply is
-  -- pending (New/Duplicate/Delete change which comps exist, Reset/Rename
+  -- pending (New/Delete change which comps exist, Reset/Rename/Apply Current
   -- change the active one's identity/contents - any of those mid-apply would
   -- pull the rug out from under ApplyGroupComposition's in-progress
   -- convergence, same as switching comps via RefreshCompList above).
   newBtn:SetDisabled(applyPending)
   resetBtn:SetDisabled(applyPending)
-  duplicateBtn:SetDisabled(applyPending)
   renameBtn:SetDisabled(applyPending)
+  -- Also mirrors Apply Groups' own "must be in a raid group" guard just
+  -- below - capturing while not in a raid would just overwrite the comp with
+  -- an empty table (GetNumGroupMembers/SnapshotRaidGroups would find nobody).
+  applyCurrentBtn:SetDisabled(applyPending or not IsInRaid())
   -- Mirrors DeleteGroupComp's own "can't delete the only composition" guard
   -- (see the confirm-delete popup's OnAccept above) - disabled up front here
   -- instead of just relying on that guard, so it's not clickable at all when
@@ -1146,7 +1149,7 @@ local function BuildGroupsFrame()
   compListScroll = AceGUI:Create("ScrollFrame")
   compListScroll:SetLayout("List")
   compListScroll:SetFullWidth(true)
-  -- Reserves room below the list for the New row, Reset/Duplicate,
+  -- Reserves room below the list for the New row, Reset/Apply Current,
   -- Rename/Delete, the 20px spacer, and Apply Groups + its status label -
   -- trimmed tighter than a generic guess would be, to help keep the window
   -- height down now that Apply Groups lives here instead of under the (much
@@ -1191,17 +1194,21 @@ local function BuildGroupsFrame()
   end)
   btnRow1:AddChild(resetBtn)
 
-  duplicateBtn = AceGUI:Create("Button")
-  duplicateBtn:SetText("Duplicate")
-  duplicateBtn:SetWidth(95)
-  duplicateBtn:SetHeight(20)
-  ns.ShrinkButtonFont(duplicateBtn)
-  duplicateBtn:SetCallback("OnClick", function()
+  applyCurrentBtn = AceGUI:Create("Button")
+  applyCurrentBtn:SetText("Apply Current")
+  applyCurrentBtn:SetWidth(95)
+  applyCurrentBtn:SetHeight(20)
+  ns.ShrinkButtonFont(applyCurrentBtn)
+  applyCurrentBtn:SetCallback("OnClick", function()
+    -- Overwrites (not merges) the active comp's groups with the raid's
+    -- actual live layout - anyone previously placed who isn't in the raid
+    -- right now simply isn't in the new table, which ComputeUnassignedWithExtras
+    -- already treats as unassigned, so no separate cleanup is needed here.
     local comp = GetComp()
-    ns.AddGroupComp(currentRosterName, comp.name .. " Copy", comp.name)
+    comp.groups = ns.CaptureGroupsFromRaid()
     RefreshGroupsWindow()
   end)
-  btnRow1:AddChild(duplicateBtn)
+  btnRow1:AddChild(applyCurrentBtn)
 
   local btnRow2 = AceGUI:Create("SimpleGroup")
   btnRow2:SetLayout("Flow")
