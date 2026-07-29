@@ -82,6 +82,10 @@ ns.BuildLootThresholdDropdownList = BuildLootThresholdDropdownList
 -- sliders/checkboxes, Enter/losing focus for text fields, since AceGUI has
 -- no per-keystroke "committed" signal for those) is the only place a value
 -- ever gets persisted.
+-- Cached and reused (never recreated) across BuildInvitesTab rebuilds - see
+-- the comment where it's populated below for why.
+local intervalWarningText
+
 local function BuildInvitesTab(container, settings)
   -- Forward-declared so the slider's OnValueChanged (defined next) can call
   -- it as an upvalue - the function body itself is assigned further below,
@@ -99,32 +103,53 @@ local function BuildInvitesTab(container, settings)
   end)
   container:AddChild(intervalSlider)
 
-  -- Reserves the same fixed height the old plain spacer occupied here,
-  -- regardless of whether the warning text below is currently shown -
-  -- SetShown()'d rather than the row itself being conditionally added/
-  -- skipped, so toggling it never changes this container's layout height
-  -- and never shifts the fields below.
   local intervalWarningRow = AceGUI:Create("SimpleGroup")
   intervalWarningRow:SetFullWidth(true)
   intervalWarningRow.noAutoHeight = true
-  intervalWarningRow:SetHeight(SECTION_SPACER_HEIGHT)
   container:AddChild(intervalWarningRow)
 
   -- Raw FontString (not an AceGUI Label, which auto-sizes its frame to the
-  -- text) using the default chat font/color so its height stays fixed and
-  -- toggling it never resizes intervalWarningRow.
-  local intervalWarningText = intervalWarningRow.content:CreateFontString(nil, "OVERLAY", "ChatFontNormal")
-  intervalWarningText:SetPoint("TOP", intervalWarningRow.content, "TOP", 0, 0)
-  intervalWarningText:SetPoint("LEFT", intervalWarningRow.content, "LEFT", 0, 0)
-  intervalWarningText:SetPoint("RIGHT", intervalWarningRow.content, "RIGHT", 0, 0)
-  intervalWarningText:SetJustifyH("CENTER")
-  intervalWarningText:SetTextColor(1, 0, 0)
-  do
+  -- text) using the default chat font/color. Created once and reused
+  -- (reparented/repositioned) on every rebuild rather than recreated -
+  -- intervalWarningRow is a pooled AceGUI SimpleGroup that gets released
+  -- and recycled on every tab switch/settings reopen (see SelectTab's
+  -- contentGroup:ReleaseChildren() above), and AceGUI has no idea this raw
+  -- FontString is attached to its content frame. Creating a fresh one each
+  -- time left the old copy behind on whatever frame the pool handed that
+  -- recycled SimpleGroup to next - drawing duplicate text on top of itself,
+  -- or bleeding into an unrelated window entirely.
+  if not intervalWarningText then
+    intervalWarningText = UIParent:CreateFontString(nil, "OVERLAY", "ChatFontNormal")
+    intervalWarningText:SetJustifyH("CENTER")
+    intervalWarningText:SetWordWrap(true)
+    intervalWarningText:SetTextColor(1, 0, 0)
     local fontPath, fontHeight, fontFlags = intervalWarningText:GetFont()
     intervalWarningText:SetFont(fontPath, fontHeight - 2, fontFlags)
+    intervalWarningText:SetText(
+      "WARNING: Interval is lower than the group invite timeout period - it will take longer to re-invite players who are AFK.")
   end
-  intervalWarningText:SetText(
-    "WARNING: Interval is lower than the group invite timeout period - it will take longer to re-invite players who are AFK.")
+  -- Explicit SetWidth, not just LEFT+RIGHT anchors, to pin down the wrap
+  -- width - anchor-resolved sizing isn't guaranteed to be reflected yet by
+  -- the time GetStringHeight() below reads it back in the same tick (that
+  -- was the previous version of this fix: it measured a stale/unwrapped
+  -- single-line height, which is also why the reserved space collapsed).
+  -- SetWidth updates the region's width immediately, so the wrap and the
+  -- measurement below are both based on the same real number.
+  intervalWarningText:SetParent(intervalWarningRow.content)
+  intervalWarningText:ClearAllPoints()
+  intervalWarningText:SetWidth(intervalWarningRow.content:GetWidth())
+  intervalWarningText:SetPoint("TOP", intervalWarningRow.content, "TOP", 0, 0)
+
+  -- Reserves however tall the fully wrapped warning text actually renders at
+  -- this row's width, measured directly with GetStringHeight() - a
+  -- hardcoded guess was wrong, and WoW frames don't clip their children, so
+  -- an undersized reservation doesn't truncate the text, it just lets the
+  -- unseen wrapped lines render underneath the next row instead. Reserved
+  -- regardless of whether the warning is currently shown - SetShown()'d
+  -- rather than the row itself being conditionally added/skipped, so
+  -- toggling it never changes this container's layout height and never
+  -- shifts the fields below.
+  intervalWarningRow:SetHeight(intervalWarningText:GetStringHeight())
 
   UpdateIntervalWarning = function(value)
     intervalWarningText:SetShown(value <= 60)
