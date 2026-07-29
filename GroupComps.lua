@@ -10,9 +10,12 @@
 -- One composition, "Default", is special only in that it's the one
 -- EnsureRosterGroupData seeds automatically (chunked from the roster's
 -- player-list order) the first time a roster is saved/seen with at least one
--- player. After that it's just an ordinary composition - roster saves in
--- UI_Rosters.lua no longer touch it, so manual rearranging of Default sticks
--- across roster edits the same as any other named composition.
+-- player and every one of them has a fully resolved "Name-Realm" entry (see
+-- AllNamesResolved) - a roster saved with any still-unresolved names is left
+-- unseeded until a later save resolves them all. After that it's just an
+-- ordinary composition - roster saves in UI_Rosters.lua no longer touch it,
+-- so manual rearranging of Default sticks across roster edits the same as
+-- any other named composition.
 --
 -- Each group (comp.groups[1..8]) is a fixed 5-slot table, addressed by
 -- explicit position 1-5 rather than compacted/appended - an empty slot is
@@ -60,6 +63,17 @@ local function ChunkListIntoGroups(list)
 end
 ns.ChunkListIntoGroups = ChunkListIntoGroups
 
+-- Per NormalizePlayerName's own contract (MakeIdiotsAppear.lua): a resolved
+-- entry is always stored as "Name-Realm", an unresolved one as just "Name" -
+-- so a missing dash reliably means "still needs a realm" without redoing any
+-- normalization work here.
+local function AllNamesResolved(rosterList)
+  for _, name in ipairs(rosterList) do
+    if not name:find("%-") then return false end
+  end
+  return true
+end
+
 local function FindComp(rosterGroupData, compName)
   for _, comp in ipairs(rosterGroupData.comps) do
     if comp.name == compName then return comp end
@@ -82,16 +96,18 @@ end
 
 -- Get-or-create the roster's group data, seeding a "Default" composition
 -- (chunked from rosterList's current order) the first time this roster is
--- saved/seen with at least one player. Deliberately does NOT seed Default
--- from an empty rosterList - EnsureRosterGroupData only seeds once (see
--- below), so seeding it empty (e.g. from GetActiveGroupComp being called to
--- just display a still-empty roster's Groups window, or from a roster's
--- very first save before any players are typed) would permanently lock in
--- an empty Default: a later save with real players would find a comp
--- already there and skip reseeding, leaving every player stuck in
--- "unassigned" instead of chunked into groups. Once seeded, Default is
--- never auto-regenerated - manual rearranging of it sticks across roster
--- edits the same as any other named composition.
+-- saved/seen with at least one player and every entry has a resolved
+-- "Name-Realm" (see AllNamesResolved). Deliberately does NOT seed Default
+-- from an empty or still-unresolved rosterList - EnsureRosterGroupData only
+-- seeds once (see below), so seeding it prematurely (e.g. from
+-- GetActiveGroupComp being called to just display a still-empty roster's
+-- Groups window, from a roster's very first save before any players are
+-- typed, or from a save that still has an unresolved name in it) would
+-- permanently lock in a wrong/incomplete Default: a later save with a fully
+-- resolved list would find a comp already there and skip reseeding, leaving
+-- players stuck in "unassigned" instead of chunked into groups. Once seeded,
+-- Default is never auto-regenerated - manual rearranging of it sticks across
+-- roster edits the same as any other named composition.
 function ns.EnsureRosterGroupData(rosterName, rosterList)
   ns.EnsureDB()
   local data = MakeIdiotsAppearDB.groupComps[rosterName]
@@ -99,7 +115,7 @@ function ns.EnsureRosterGroupData(rosterName, rosterList)
     data = { activeComp = "Default", comps = {} }
     MakeIdiotsAppearDB.groupComps[rosterName] = data
   end
-  if #data.comps == 0 and rosterList and #rosterList > 0 then
+  if #data.comps == 0 and rosterList and #rosterList > 0 and AllNamesResolved(rosterList) then
     table.insert(data.comps, { name = "Default", groups = ChunkListIntoGroups(rosterList) })
     data.activeComp = "Default"
   end
