@@ -1016,19 +1016,48 @@ local function ConvertPartyToRaid()
 end
 
 -- Same namespaced-vs-global fallback as ConvertPartyToRaid above - newer
--- clients moved loot-method access under C_PartyInfo too.
+-- clients moved loot-method access under C_PartyInfo too. The two APIs
+-- disagree on types though: legacy GetLootMethod()/SetLootMethod() use the
+-- string method names ("master", etc.) and a numeric party/raid index for
+-- the loot master, while C_PartyInfo.GetLootMethod()/SetLootMethod() use
+-- Enum.LootMethod numbers for the method and a name string for the loot
+-- master. These tables translate both ways so call sites below can keep
+-- comparing against/passing the familiar legacy strings.
+local LOOT_METHOD_TO_ENUM = {
+  freeforall = Enum.LootMethod.Freeforall,
+  group = Enum.LootMethod.Group,
+  master = Enum.LootMethod.Masterlooter,
+  needbeforegreed = Enum.LootMethod.Needbeforegreed,
+  personalloot = Enum.LootMethod.Personal,
+}
+
+local LOOT_METHOD_FROM_ENUM = {
+  [Enum.LootMethod.Freeforall] = "freeforall",
+  [Enum.LootMethod.Roundrobin] = "group",
+  [Enum.LootMethod.Masterlooter] = "master",
+  [Enum.LootMethod.Group] = "group",
+  [Enum.LootMethod.Needbeforegreed] = "needbeforegreed",
+  [Enum.LootMethod.Personal] = "personalloot",
+}
+
 local function DoGetLootMethod()
   if C_PartyInfo and C_PartyInfo.GetLootMethod then
-    return C_PartyInfo.GetLootMethod()
+    local method = C_PartyInfo.GetLootMethod()
+    return LOOT_METHOD_FROM_ENUM[method] or method
   end
   return GetLootMethod()
 end
 
-local function DoSetLootMethod(method, index)
+-- lootMasterName/lootMasterIndex are both optional and only meaningful for
+-- method == "master" - C_PartyInfo.SetLootMethod wants the loot master's
+-- name (string), the legacy global wants their party/raid index (number).
+-- Callers pass whichever they have available (see MaybeSetMasterLoot and
+-- MaybeSetMasterLooter below).
+local function DoSetLootMethod(method, lootMasterName, lootMasterIndex)
   if C_PartyInfo and C_PartyInfo.SetLootMethod then
-    C_PartyInfo.SetLootMethod(method, index)
+    C_PartyInfo.SetLootMethod(LOOT_METHOD_TO_ENUM[method] or method, lootMasterName)
   else
-    SetLootMethod(method, index)
+    SetLootMethod(method, lootMasterIndex)
   end
 end
 
@@ -1121,7 +1150,7 @@ end)
 -- nobody would ever ask again for whoever missed out - they'd just sit
 -- pending until the pass gives up and reports them as unknown.
 local function CheckNewlyJoinedDurability()
-  if not Engine.running or not MakeIdiotsAppearDB.settings.durabilityWarningEnabled then
+  if not (Engine.running or Engine.starting) or not MakeIdiotsAppearDB.settings.durabilityWarningEnabled then
     return
   end
 
@@ -1776,6 +1805,7 @@ local MASTER_LOOT_MIN_GROUP_SIZE = 10
 local function MaybeSetMasterLoot()
   local settings = MakeIdiotsAppearDB.settings
   if not settings.autoMasterLoot then return end
+  if not (Engine.running or Engine.starting) then return end
   if not IsInRaid() then return end
   if GetNumGroupMembers() <= MASTER_LOOT_MIN_GROUP_SIZE then return end
   if not UnitIsGroupLeader("player") then return end
@@ -1784,7 +1814,11 @@ local function MaybeSetMasterLoot()
   local playerIndex = GetPlayerRaidIndex()
   if not playerIndex then return end
 
-  DoSetLootMethod("master", playerIndex)
+  -- UnitName("player") here, not GetFullUnitName("player")'s "Name-Realm" -
+  -- confirmed in-game that C_PartyInfo.SetLootMethod's lootMaster name
+  -- fails to resolve against your own realm-qualified name, only the bare
+  -- name UnitName("player") always returns for yourself.
+  DoSetLootMethod("master", UnitName("player"), playerIndex)
 end
 
 ----------------------------------------------------------------------
@@ -1798,6 +1832,7 @@ end
 local function MaybeSetLootThreshold()
   local settings = MakeIdiotsAppearDB.settings
   if not settings.autoLootThreshold then return end
+  if not (Engine.running or Engine.starting) then return end
   if Engine.masterLooterPromoted then return end
   if not IsInRaid() then return end
   if not UnitIsGroupLeader("player") then return end
@@ -1839,6 +1874,7 @@ end
 local function MaybeSetMasterLooter()
   local settings = MakeIdiotsAppearDB.settings
   if not settings.autoPromoteMasterLooter then return end
+  if not (Engine.running or Engine.starting) then return end
   if Engine.masterLooterPromoted then return end
   if not IsInRaid() then return end
   if not UnitIsGroupLeader("player") then return end
@@ -1850,7 +1886,12 @@ local function MaybeSetMasterLooter()
     if matchedFullName then
       local raidIndex = FindRaidIndexForFullName(matchedFullName)
       if raidIndex then
-        DoSetLootMethod("master", raidIndex)
+        -- Same self-name quirk as MaybeSetMasterLoot above: a candidate
+        -- who happens to be the player themselves needs UnitName("player"),
+        -- not their realm-qualified matchedFullName, or the API call fails
+        -- to resolve them as the loot master.
+        local lootMasterName = UnitIsUnit("raid" .. raidIndex, "player") and UnitName("player") or matchedFullName
+        DoSetLootMethod("master", lootMasterName, raidIndex)
         Engine.masterLooterPromoted = true
       end
       return
