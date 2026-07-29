@@ -665,6 +665,34 @@ local function GetGroupNameSet()
 end
 ns.GetGroupNameSet = GetGroupNameSet
 
+-- Companion to GetGroupNameSet above, same scan but keyed to only the
+-- raid/party members who are currently disconnected (UnitIsConnected
+-- false) - lets UI_Groups.lua's red missing-indicator bar distinguish
+-- "still in the group, just offline" from "not in the group at all" (see
+-- ComputeNameColor there, which still uses plain GetGroupNameSet for that
+-- broader case). Self is never included - never offline from its own
+-- client, so no need to even check.
+local function GetGroupOfflineNameSet()
+  local set = {}
+  local function record(unit)
+    if UnitIsConnected(unit) then return end
+    local full = GetFullUnitName(unit)
+    if full then set[full:lower()] = full end
+  end
+
+  if IsInRaid() then
+    for i = 1, GetNumGroupMembers() do
+      record("raid" .. i)
+    end
+  elseif IsInGroup() then
+    for i = 1, GetNumGroupMembers() - 1 do
+      record("party" .. i)
+    end
+  end
+  return set
+end
+ns.GetGroupOfflineNameSet = GetGroupOfflineNameSet
+
 -- Looks a roster entry up in a map keyed by full "name-realm" (as built by
 -- GetGroupNameSet/GetGuildOnlineMap/GetClassMap). Falls back to a name-only
 -- scan only when the roster entry itself has no resolved realm yet.

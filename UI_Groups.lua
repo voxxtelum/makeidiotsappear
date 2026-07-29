@@ -251,14 +251,20 @@ ns.AddBorderedBackground = AddBorderedBackground
 -- reads the same grey everywhere in the addon.
 local MISSING_NAME_R, MISSING_NAME_G, MISSING_NAME_B = 0.6, 0.6, 0.6
 
--- Class color, unless the player isn't currently in your raid/party (per
--- groupSet - same check UpdateMissingIndicator below uses for the red bar),
--- in which case grey instead - groupSet is nil-safe (omit it to always get
--- class color, e.g. anywhere a missing-indicator check doesn't apply).
--- Plain white if we don't know their class (shouldn't normally happen for
--- anyone actually placed in a slot).
-local function ComputeNameColor(name, classMap, groupSet)
-  if groupSet and name and not ns.LookupByFullOrName(groupSet, name) then
+-- Class color, unless the player is actually on the current roster (per
+-- rosterSet - see BuildRosterNameSet below) but isn't currently in your
+-- raid/party (per groupSet), in which case grey instead - a name that isn't
+-- on the roster at all (a manually-typed EditBox entry, e.g.) never turns
+-- grey this way, even if it also happens not to be in groupSet, since
+-- "missing from the raid" only means something for someone we're actually
+-- expecting. Both rosterSet and groupSet are nil-safe (omit either to
+-- always get class color, e.g. anywhere this check doesn't apply). Plain
+-- white if we don't know their class (shouldn't normally happen for anyone
+-- actually placed in a slot).
+local function ComputeNameColor(name, classMap, groupSet, rosterSet)
+  if rosterSet and groupSet and name
+      and (rosterSet[name:lower()] or rosterSet[ns.NamePart(name)])
+      and not ns.LookupByFullOrName(groupSet, name) then
     return MISSING_NAME_R, MISSING_NAME_G, MISSING_NAME_B
   end
   local classFile = ns.LookupByFullOrName(classMap, name)
@@ -269,13 +275,13 @@ local function ComputeNameColor(name, classMap, groupSet)
   return 1, 1, 1
 end
 
--- Thin red bar on the left edge, shown only when the named player is not
--- currently a member of your raid/party (checked via groupSet - see
--- MakeIdiotsAppear.lua's GetGroupNameSet) - hidden for everyone actually in
--- the group, for empty slots, and always for yourself (DoRefreshGroupsWindow
--- forces your own name into groupSet before this ever runs, since you're
--- inherently "online" to your own client whether or not you've actually
--- joined a raid/party yet).
+-- Thin red bar on the left edge, shown only when the named player is
+-- currently a member of your raid/party but disconnected (checked via
+-- offlineSet - see MakeIdiotsAppear.lua's GetGroupOfflineNameSet) - hidden
+-- for empty slots, for anyone actually connected, and for anyone not in the
+-- group at all (that broader case is what ComputeNameColor's grey handles
+-- instead). Always hidden for yourself, same as ComputeNameColor - you're
+-- never offline from your own client.
 local MISSING_INDICATOR_WIDTH = 2
 
 local function AddMissingIndicator(f)
@@ -289,12 +295,38 @@ local function AddMissingIndicator(f)
   return indicator
 end
 
-local function UpdateMissingIndicator(f, name, groupSet)
-  if name and not ns.LookupByFullOrName(groupSet, name) then
+local function UpdateMissingIndicator(f, name, offlineSet)
+  if name and ns.LookupByFullOrName(offlineSet, name) then
     f.missingIndicator:Show()
   else
     f.missingIndicator:Hide()
   end
+end
+
+-- Same offlineSet condition as the red bar above - 50% transparent name
+-- text for anyone currently in your raid/party but disconnected, full
+-- opacity otherwise.
+local OFFLINE_NAME_ALPHA = 0.5
+
+local function ComputeNameAlpha(name, offlineSet)
+  if name and ns.LookupByFullOrName(offlineSet, name) then
+    return OFFLINE_NAME_ALPHA
+  end
+  return 1
+end
+
+-- Same offlineSet condition and alpha (OFFLINE_NAME_ALPHA above) as the name
+-- text - light grey, 50% transparent slot/token background for anyone
+-- currently in your raid/party but disconnected, normal dark fill
+-- otherwise.
+local OFFLINE_BACKGROUND_R, OFFLINE_BACKGROUND_G, OFFLINE_BACKGROUND_B = 0.3, 0.3, 0.3
+local SLOT_FILL_R, SLOT_FILL_G, SLOT_FILL_B, SLOT_FILL_A = 0.06, 0.06, 0.06, 0.9
+
+local function ComputeSlotBackgroundColor(name, offlineSet)
+  if name and ns.LookupByFullOrName(offlineSet, name) then
+    return OFFLINE_BACKGROUND_R, OFFLINE_BACKGROUND_G, OFFLINE_BACKGROUND_B, OFFLINE_NAME_ALPHA
+  end
+  return SLOT_FILL_R, SLOT_FILL_G, SLOT_FILL_B, SLOT_FILL_A
 end
 
 -- Light grey "B" pinned to the right edge, shown only for roster entries
@@ -378,7 +410,9 @@ local function CreateTokenFrame(parent)
   f:SetSize(SLOT_WIDTH, SLOT_HEIGHT)
   f:SetFrameStrata(RESTING_STRATA)
 
-  AddBorderedBackground(f, 0.06, 0.06, 0.06, 0.9)
+  -- Stashed on f so SetTokenDisplay can recolor it later (see
+  -- ComputeSlotBackgroundColor) once this frame's actual name is known.
+  f.background = AddBorderedBackground(f, SLOT_FILL_R, SLOT_FILL_G, SLOT_FILL_B, SLOT_FILL_A)
 
   AddMissingIndicator(f)
   AddBenchMarker(f)
@@ -491,15 +525,16 @@ end
 local coloredFontCache = {}
 local coloredFontCount = 0
 
-local function GetColoredFont(r, g, b)
-  local key = r .. "|" .. g .. "|" .. b
+local function GetColoredFont(r, g, b, a)
+  a = a or 1
+  local key = r .. "|" .. g .. "|" .. b .. "|" .. a
   local font = coloredFontCache[key]
   if not font then
     coloredFontCount = coloredFontCount + 1
     font = CreateFont("MakeIdiotsAppearSlotFont" .. coloredFontCount)
     local fontFile, fontHeight, fontFlags = SlotBaseFont:GetFont()
     font:SetFont(fontFile, fontHeight, fontFlags)
-    font:SetTextColor(r, g, b)
+    font:SetTextColor(r, g, b, a)
     coloredFontCache[key] = font
   end
   return font
@@ -514,7 +549,9 @@ local function CreateEditableSlot(parent)
   f:SetJustifyH("LEFT")
   f:SetTextInsets(4, 4, 1, 1)
 
-  AddBorderedBackground(f, 0.06, 0.06, 0.06, 0.9)
+  -- Stashed on f so SetSlotEditBoxDisplay can recolor it later (see
+  -- ComputeSlotBackgroundColor) once this slot's actual name is known.
+  f.background = AddBorderedBackground(f, SLOT_FILL_R, SLOT_FILL_G, SLOT_FILL_B, SLOT_FILL_A)
 
   AddMissingIndicator(f)
   AddBenchMarker(f)
@@ -571,12 +608,14 @@ local function ResetSlotHome(slot)
   slot:SetFrameStrata(RESTING_STRATA)
 end
 
-local function SetTokenDisplay(frame, name, classMap, groupSet, benchSet, rlFullName)
+local function SetTokenDisplay(frame, name, classMap, groupSet, rosterSet, offlineSet, benchSet, rlFullName)
   frame.text:SetText(name or "")
   if name then
-    frame.text:SetTextColor(ComputeNameColor(name, classMap, groupSet))
+    local r, g, b = ComputeNameColor(name, classMap, groupSet, rosterSet)
+    frame.text:SetTextColor(r, g, b, ComputeNameAlpha(name, offlineSet))
   end
-  UpdateMissingIndicator(frame, name, groupSet)
+  SetTextureColor(frame.background, ComputeSlotBackgroundColor(name, offlineSet))
+  UpdateMissingIndicator(frame, name, offlineSet)
   UpdateBenchMarker(frame, name, benchSet)
   UpdateLeaderIcon(frame, name, rlFullName)
 end
@@ -588,18 +627,20 @@ end
 -- Color is applied via GetColoredFont/SetFontObject rather than
 -- SetTextColor - see the comment above CreateEditableSlot's font cache for
 -- why.
-local function SetSlotEditBoxDisplay(slot, name, classMap, groupSet, benchSet, rlFullName)
+local function SetSlotEditBoxDisplay(slot, name, classMap, groupSet, rosterSet, offlineSet, benchSet, rlFullName)
   if slot:HasFocus() then
     return
   end
   slot:SetText(name or "")
   slot.textAtFocus = name or ""
   if name then
-    slot:SetFontObject(GetColoredFont(ComputeNameColor(name, classMap, groupSet)))
+    local r, g, b = ComputeNameColor(name, classMap, groupSet, rosterSet)
+    slot:SetFontObject(GetColoredFont(r, g, b, ComputeNameAlpha(name, offlineSet)))
   else
     slot:SetFontObject(SlotBaseFont)
   end
-  UpdateMissingIndicator(slot, name, groupSet)
+  SetTextureColor(slot.background, ComputeSlotBackgroundColor(name, offlineSet))
+  UpdateMissingIndicator(slot, name, offlineSet)
   UpdateBenchMarker(slot, name, benchSet)
   UpdateLeaderIcon(slot, name, rlFullName)
 end
@@ -736,6 +777,21 @@ StaticPopupDialogs["MAKEIDIOTSAPPEAR_CONFIRM_DELETE_GROUPCOMP"] = {
   preferredIndex = 3,
 }
 
+-- Every name on the given roster, keyed both by full lowercased "name-realm"
+-- and by bare lowercased name (NamePart) - lets a lookup succeed whether the
+-- caller only has a bare name or the full "name-realm" form. Shared by
+-- ComputeUnassignedWithExtras below and ComputeNameColor above (via
+-- DoRefreshGroupsWindow), which both need to know "is this name actually on
+-- the roster" for different reasons.
+local function BuildRosterNameSet(rosterList)
+  local set = {}
+  for _, name in ipairs(rosterList) do
+    set[name:lower()] = true
+    set[ns.NamePart(name)] = true
+  end
+  return set
+end
+
 -- ns.ComputeUnassigned only knows about the roster; this also surfaces
 -- anyone currently in the raid/party who isn't on the roster at all (e.g. a
 -- last-minute pug) - the same "not in list" concept UI_Main.lua's extras row
@@ -756,11 +812,7 @@ local function ComputeUnassignedWithExtras(rosterList, comp, groupSet)
     end
   end
 
-  local rosterKeys = {}
-  for _, name in ipairs(rosterList) do
-    rosterKeys[name:lower()] = true
-    rosterKeys[ns.NamePart(name)] = true
-  end
+  local rosterKeys = BuildRosterNameSet(rosterList)
 
   local extras = {}
   for key, fullName in pairs(groupSet) do
@@ -828,17 +880,24 @@ local function DoRefreshGroupsWindow()
   local applyPending = ns.GroupApplyEngine.pending
   local classMap = ns.GetClassMap()
   local groupSet = ns.GetGroupNameSet()
-  -- Always treat ourselves as present in this window's missing-indicator
-  -- check (see UpdateMissingIndicator), regardless of whether we're actually
-  -- in a raid/party right now - we're the one looking at this UI, so we're
-  -- inherently online, e.g. even while solo planning group comps ahead of an
-  -- invite. GetGroupNameSet() returns a fresh table each call, so mutating
-  -- this local copy doesn't affect any other consumer of that function
-  -- (invite-loop straggler/completion checks etc. still see the real state).
+  -- Always treat ourselves as present in this window's grey-name check (see
+  -- ComputeNameColor), regardless of whether we're actually in a raid/party
+  -- right now - we're the one looking at this UI, so we're inherently
+  -- online, e.g. even while solo planning group comps ahead of an invite.
+  -- GetGroupNameSet() returns a fresh table each call, so mutating this
+  -- local copy doesn't affect any other consumer of that function (invite-
+  -- loop straggler/completion checks etc. still see the real state).
   local ownFullName = ns.GetFullUnitName("player")
   if ownFullName then
     groupSet[ownFullName:lower()] = ownFullName
   end
+  -- Separate from groupSet above - see UpdateMissingIndicator for why the
+  -- red bar needs its own, narrower "in the group but disconnected" set.
+  local offlineSet = ns.GetGroupOfflineNameSet()
+  -- See ComputeNameColor - grey only applies to an actual roster member
+  -- missing from the raid/party, not to any arbitrary name (e.g. a manually
+  -- typed EditBox entry) that simply isn't in groupSet.
+  local rosterSet = BuildRosterNameSet(rosterList)
   local rlFullName = ns.FindRaidLeader()
 
   -- Bench = roster entries past the roster's own group size (see
@@ -860,7 +919,7 @@ local function DoRefreshGroupsWindow()
     for p = 1, SLOTS_PER_GROUP do
       local slot = slotFrames[g][p]
       ResetSlotHome(slot)
-      SetSlotEditBoxDisplay(slot, list[p], classMap, groupSet, benchSet, rlFullName)
+      SetSlotEditBoxDisplay(slot, list[p], classMap, groupSet, rosterSet, offlineSet, benchSet, rlFullName)
       -- EnableMouse(false) blocks click-to-focus, the right-click-to-clear
       -- shortcut, and drag-start all at once (all three are gated on the
       -- frame actually receiving mouse events) - the dimmed alpha is purely
@@ -888,7 +947,7 @@ local function DoRefreshGroupsWindow()
     local token = AcquireUnassignedToken(i)
     token:SetWidth(tokenWidth)
     token.playerName = name
-    SetTokenDisplay(token, name, classMap, groupSet, benchSet, rlFullName)
+    SetTokenDisplay(token, name, classMap, groupSet, rosterSet, offlineSet, benchSet, rlFullName)
     -- Same EnableMouse+alpha lockdown as the group slots above - blocks the
     -- right-click-to-place shortcut and drag-start together.
     token:EnableMouse(not applyPending)
