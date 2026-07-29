@@ -1173,9 +1173,11 @@ end
 ns.StopInvites = StopInvites
 
 -- Names from the full roster that are not currently in our raid/party -
--- these are the only ones worth another pass.
-local function ComputeStragglers()
-  local groupSet = GetGroupNameSet()
+-- these are the only ones worth another pass. Takes groupSet from the caller
+-- rather than fetching it itself - RunInvitePass's own group scan is still
+-- valid here (see the comment at its end-of-pass call site), so there's no
+-- need to walk the raid/party roster a second time.
+local function ComputeStragglers(groupSet)
   local stragglers = {}
   for _, name in ipairs(Engine.fullRoster) do
     -- Skip anyone who still has one of our invites outstanding and not yet
@@ -1218,55 +1220,76 @@ local PruneExpiredPendingInvites
 -- CHAT_MSG_SYSTEM bounce handlers further down.
 local RequeueForRetry
 
+-- A party caps out at 5 total, and inviting past that requires being a
+-- raid. The server reserves a slot for an invite the instant it's sent, not
+-- once it's accepted - including while still completely solo, before
+-- GetNumGroupMembers() ever leaves 0 - so yourself (at least 1) plus every
+-- outstanding invite has to be counted against the cap from the very first
+-- invite of a pass, not just once a party is already confirmed to exist.
+-- Every invite immediately counts against the cap alongside confirmed
+-- members - even to someone who turns out to be offline - so pending
+-- invites have to be counted here too, not just confirmed members, or we'd
+-- try to send a 3rd/4th/5th invite the game has already reserved a full
+-- party against and have it bounce.
+--
+-- pendingCount is passed in rather than read via CountPendingInvites() -
+-- RunInvitePass calls this once per queued name, and nothing inside that
+-- loop can shrink Engine.pendingInvites (only PruneExpiredPendingInvites, at
+-- the top of RunInvitePass before the loop starts, does that), so the
+-- caller can just track the running count itself instead of re-scanning the
+-- whole pendingInvites table on every iteration.
+--
+-- Returns true if the pass must stop here and wait on a raid conversion,
+-- false if there's room to keep inviting.
+local function HandleFullPartyCapacity(pendingCount)
+  if IsInRaid() then
+    Engine.convertingToRaid = nil
+    Engine.convertRetryCount = 0
+    return false
+  end
+
+  local confirmedSize = math.max(GetNumGroupMembers(), 1)
+  if confirmedSize + pendingCount < 5 then
+    Engine.convertingToRaid = nil
+    Engine.convertRetryCount = 0
+    return false
+  end
+
+  Engine.convertRetryCount = Engine.convertRetryCount + 1
+  if Engine.convertRetryCount > 6 then
+    print(PREFIX ..
+      "Could not convert to a raid automatically - please use /convert to raid manually, then click Start Invites again.")
+    Engine.convertingToRaid = nil
+    Engine.convertRetryCount = 0
+    FireStateChanged()
+    return true
+  end
+
+  if not Engine.convertingToRaid then
+    Engine.convertingToRaid = true
+    print(PREFIX .. "Party is full - converting to a raid group so everyone can be invited.")
+    ConvertPartyToRaid()
+  end
+  FireStateChanged()
+  C_Timer.After(1.5, SafeRunInvitePass)
+  return true
+end
+
 -- Invites everyone currently queued, right now, back to back - no waiting
 -- between individual invites (up to whatever the group can currently hold -
--- see the capacity check at the top of the loop below). Called once
--- immediately when a run starts (so the whole roster goes out in one go),
--- and again on each retry-pass tick for whoever's still missing.
+-- see HandleFullPartyCapacity above). Called once immediately when a run
+-- starts (so the whole roster goes out in one go), and again on each
+-- retry-pass tick for whoever's still missing.
 RunInvitePass = function()
   PruneExpiredPendingInvites()
 
   local groupSet = GetGroupNameSet()
   local guildOnline = GetGuildOnlineMap()
   local ownFullName = GetFullUnitName("player")
+  local pendingCount = CountPendingInvites()
 
   while #Engine.queue > 0 do
-    -- A party caps out at 5 total, and inviting past that requires being
-    -- a raid. The server reserves a slot for an invite the instant it's
-    -- sent, not once it's accepted - including while still completely
-    -- solo, before GetNumGroupMembers() ever leaves 0 - so yourself (at
-    -- least 1) plus every outstanding invite has to be counted against the
-    -- cap from the very first invite of a pass, not just once a party is
-    -- already confirmed to exist. Every invite immediately counts against
-    -- the cap alongside confirmed members - even to someone who turns out
-    -- to be offline - so pending invites have to be counted here too, not
-    -- just confirmed members, or we'd try to send a 3rd/4th/5th invite the
-    -- game has already reserved a full party against and have it bounce.
-    if not IsInRaid() then
-      local confirmedSize = math.max(GetNumGroupMembers(), 1)
-      if confirmedSize + CountPendingInvites() >= 5 then
-        Engine.convertRetryCount = Engine.convertRetryCount + 1
-        if Engine.convertRetryCount > 6 then
-          print(PREFIX ..
-            "Could not convert to a raid automatically - please use /convert to raid manually, then click Start Invites again.")
-          Engine.convertingToRaid = nil
-          Engine.convertRetryCount = 0
-          FireStateChanged()
-          return
-        end
-
-        if not Engine.convertingToRaid then
-          Engine.convertingToRaid = true
-          print(PREFIX .. "Party is full - converting to a raid group so everyone can be invited.")
-          ConvertPartyToRaid()
-        end
-        FireStateChanged()
-        C_Timer.After(1.5, SafeRunInvitePass)
-        return
-      end
-    end
-    Engine.convertingToRaid = nil
-    Engine.convertRetryCount = 0
+    if HandleFullPartyCapacity(pendingCount) then return end
 
     local nextName = table.remove(Engine.queue, 1)
 
@@ -1317,6 +1340,7 @@ RunInvitePass = function()
       if ok then
         Engine.pendingInvites[nextName:lower()] = nextName
         Engine.pendingInviteSentAt[nextName:lower()] = GetTime()
+        pendingCount = pendingCount + 1
       else
         print(PREFIX .. "Could not invite " .. nextName .. " (" .. tostring(err) .. "). Will retry next pass.")
         table.insert(Engine.skipped, nextName)
@@ -1344,11 +1368,10 @@ RunInvitePass = function()
   -- going to happen. The ticker in StartInvites fires on its own fixed
   -- schedule regardless of when any given pass happens to finish, so it's
   -- the only thing that gets to set nextPassAt.
-  local stragglers = ComputeStragglers()
-  local currentGroupSet = GetGroupNameSet()
+  local stragglers = ComputeStragglers(groupSet)
   local everyoneJoined = true
   for _, name in ipairs(Engine.fullRoster) do
-    if not LookupByFullOrName(currentGroupSet, name) then
+    if not LookupByFullOrName(groupSet, name) then
       everyoneJoined = false
       break
     end
@@ -1536,6 +1559,18 @@ local function ClearPendingInvite(key)
   Engine.pendingInviteSentAt[key] = nil
 end
 
+-- Shared by RequeueForRetry/RequeueForImmediateRetry below - both just push
+-- into a different Engine queue table, with the same "don't add a duplicate"
+-- scan first.
+local function InsertIfAbsent(queue, fullName)
+  for _, queued in ipairs(queue) do
+    if queued:lower() == fullName:lower() then
+      return
+    end
+  end
+  table.insert(queue, fullName)
+end
+
 -- Lets someone who resolves as "not joined" (declined or bounced - a real
 -- response from the game, not silence) become eligible for the next
 -- scheduled round - but not before then: goes into nextQueue rather than
@@ -1549,12 +1584,7 @@ end
 -- retry too early" concern this function exists for.
 RequeueForRetry = function(fullName)
   if not Engine.running then return end
-  for _, queued in ipairs(Engine.nextQueue) do
-    if queued:lower() == fullName:lower() then
-      return
-    end
-  end
-  table.insert(Engine.nextQueue, fullName)
+  InsertIfAbsent(Engine.nextQueue, fullName)
 end
 
 -- Used only by PruneExpiredPendingInvites, which runs at the very top of
@@ -1564,12 +1594,7 @@ end
 -- extra interval on top of the 61s it already waited.
 local function RequeueForImmediateRetry(fullName)
   if not Engine.running then return end
-  for _, queued in ipairs(Engine.queue) do
-    if queued:lower() == fullName:lower() then
-      return
-    end
-  end
-  table.insert(Engine.queue, fullName)
+  InsertIfAbsent(Engine.queue, fullName)
 end
 
 -- Multiple invites can be outstanding at once now, so a system message has to
