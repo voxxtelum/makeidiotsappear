@@ -82,6 +82,10 @@ local unassignedContent = nil
 local unassignedTokenPool = {}
 
 local compListScroll = nil
+local newBtn = nil
+local resetBtn = nil
+local duplicateBtn = nil
+local renameBtn = nil
 local deleteBtn = nil
 local applyBtn = nil
 local applyStatusLabel = nil
@@ -783,6 +787,12 @@ end
 
 local function RefreshCompList(data)
   compListScroll:ReleaseChildren()
+  -- Switching the active comp (or its underlying groups changing shape via
+  -- New/Duplicate/Delete etc.) mid-apply would pull the rug out from under
+  -- ApplyGroupComposition's in-progress convergence - disabled here rather
+  -- than letting the click through, same reasoning as applyBtn's own
+  -- ns.GroupApplyEngine.pending check in DoRefreshGroupsWindow.
+  local applyPending = ns.GroupApplyEngine.pending
   for _, comp in ipairs(data.comps) do
     local btn = AceGUI:Create("Button")
     btn:SetFullWidth(true)
@@ -794,6 +804,7 @@ local function RefreshCompList(data)
     ns.ShrinkButtonFont(btn)
     btn.compName = comp.name
     btn:SetCallback("OnClick", OnCompButtonClick)
+    btn:SetDisabled(applyPending)
     compListScroll:AddChild(btn)
   end
   compListScroll:DoLayout()
@@ -811,6 +822,10 @@ end
 local function DoRefreshGroupsWindow()
   local rosterList = GetRosterList()
   local comp, data = GetComp()
+  -- Read once up front (rather than each spot below re-checking
+  -- ns.GroupApplyEngine.pending) so the grid, pool, and every management
+  -- button below all agree on the same pending snapshot for this refresh.
+  local applyPending = ns.GroupApplyEngine.pending
   local classMap = ns.GetClassMap()
   local groupSet = ns.GetGroupNameSet()
   -- Always treat ourselves as present in this window's missing-indicator
@@ -846,6 +861,12 @@ local function DoRefreshGroupsWindow()
       local slot = slotFrames[g][p]
       ResetSlotHome(slot)
       SetSlotEditBoxDisplay(slot, list[p], classMap, groupSet, benchSet, rlFullName)
+      -- EnableMouse(false) blocks click-to-focus, the right-click-to-clear
+      -- shortcut, and drag-start all at once (all three are gated on the
+      -- frame actually receiving mouse events) - the dimmed alpha is purely
+      -- cosmetic on top, so a locked grid still reads as locked at a glance.
+      slot:EnableMouse(not applyPending)
+      slot:SetAlpha(applyPending and 0.5 or 1)
     end
   end
 
@@ -868,6 +889,10 @@ local function DoRefreshGroupsWindow()
     token:SetWidth(tokenWidth)
     token.playerName = name
     SetTokenDisplay(token, name, classMap, groupSet, benchSet, rlFullName)
+    -- Same EnableMouse+alpha lockdown as the group slots above - blocks the
+    -- right-click-to-place shortcut and drag-start together.
+    token:EnableMouse(not applyPending)
+    token:SetAlpha(applyPending and 0.5 or 1)
     token:ClearAllPoints()
     token:SetPoint("TOPLEFT", unassignedContent, "TOPLEFT", 0, -(i - 1) * (SLOT_HEIGHT + SLOT_GAP))
     token:Show()
@@ -885,14 +910,22 @@ local function DoRefreshGroupsWindow()
 
   RefreshCompList(data)
 
+  -- Comp management buttons: all disabled outright while an apply is
+  -- pending (New/Duplicate/Delete change which comps exist, Reset/Rename
+  -- change the active one's identity/contents - any of those mid-apply would
+  -- pull the rug out from under ApplyGroupComposition's in-progress
+  -- convergence, same as switching comps via RefreshCompList above).
+  newBtn:SetDisabled(applyPending)
+  resetBtn:SetDisabled(applyPending)
+  duplicateBtn:SetDisabled(applyPending)
+  renameBtn:SetDisabled(applyPending)
   -- Mirrors DeleteGroupComp's own "can't delete the only composition" guard
   -- (see the confirm-delete popup's OnAccept above) - disabled up front here
   -- instead of just relying on that guard, so it's not clickable at all when
   -- it would just print a rejection.
-  deleteBtn:SetDisabled(#data.comps <= 1)
+  deleteBtn:SetDisabled(applyPending or #data.comps <= 1)
 
-  local engine = ns.GroupApplyEngine
-  if engine.pending then
+  if applyPending then
     applyBtn:SetDisabled(true)
     applyBtn:SetText("Applying...")
     applyStatusLabel:SetText("Moving players into place - this can take a few moments.")
@@ -1126,7 +1159,7 @@ local function BuildGroupsFrame()
   newRow:SetFullWidth(true)
   rightGroup:AddChild(newRow)
 
-  local newBtn = AceGUI:Create("Button")
+  newBtn = AceGUI:Create("Button")
   newBtn:SetText("New")
   newBtn:SetRelativeWidth(0.99)
   newBtn:SetHeight(20)
@@ -1142,7 +1175,7 @@ local function BuildGroupsFrame()
   btnRow1:SetFullWidth(true)
   rightGroup:AddChild(btnRow1)
 
-  local resetBtn = AceGUI:Create("Button")
+  resetBtn = AceGUI:Create("Button")
   resetBtn:SetText("Reset")
   resetBtn:SetWidth(95)
   resetBtn:SetHeight(20)
@@ -1158,7 +1191,7 @@ local function BuildGroupsFrame()
   end)
   btnRow1:AddChild(resetBtn)
 
-  local duplicateBtn = AceGUI:Create("Button")
+  duplicateBtn = AceGUI:Create("Button")
   duplicateBtn:SetText("Duplicate")
   duplicateBtn:SetWidth(95)
   duplicateBtn:SetHeight(20)
@@ -1175,7 +1208,7 @@ local function BuildGroupsFrame()
   btnRow2:SetFullWidth(true)
   rightGroup:AddChild(btnRow2)
 
-  local renameBtn = AceGUI:Create("Button")
+  renameBtn = AceGUI:Create("Button")
   renameBtn:SetText("Rename")
   renameBtn:SetWidth(95)
   renameBtn:SetHeight(20)

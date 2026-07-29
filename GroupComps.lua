@@ -509,6 +509,7 @@ function ns.StepApplyEngine()
   -- into a temporary slot wouldn't behave like a normal member's move would.
   local swappedOut = {}
   local anyUnresolved = false
+  local unresolvedNames = {}
   for key, pos in pairs(needPosInGroup) do
     if not lockedUnit[key] and currentPos[key] and currentPos[key] ~= pos
         and key ~= ApplyEngine.rlKey and not swappedOut[key] then
@@ -543,14 +544,19 @@ function ns.StepApplyEngine()
         -- No bridge candidate exists (e.g. this group's members are the
         -- only people currently in the raid) - reordering within it isn't
         -- possible with the raid-subgroup API, note it and move on instead
-        -- of looping on it forever.
+        -- of looping on it forever. nameToID[key] is still this same
+        -- snapshot's raid unit index, so it's safe to resolve back to a
+        -- display name synchronously here.
         anyUnresolved = true
+        table.insert(unresolvedNames, ns.GetFullUnitName("raid" .. nameToID[key]) or key)
       end
     end
   end
 
   if anyUnresolved then
-    StopApplyEngine("Groups applied - some players could not be reordered (no one outside their group to temporarily swap through).")
+    table.sort(unresolvedNames)
+    StopApplyEngine("Groups applied - some players could not be reordered (" ..
+      table.concat(unresolvedNames, ", ") .. ").")
   else
     StopApplyEngine("Groups applied.")
   end
