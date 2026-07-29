@@ -249,6 +249,7 @@ function ns.DeleteRoster(name)
   print(PREFIX .. "Deleted roster '" .. name .. "'.")
   RefreshRosterList()
   ns.FireStateChanged()
+  ns.SyncActiveRosterIntoRun()
 end
 
 local function BuildRosterManagerFrame()
@@ -434,6 +435,7 @@ local function BuildRosterManagerFrame()
       RefreshGroupSizeSelection()
       print(PREFIX .. string.format("Set group size for '%s' to %d.", selectedRoster, size))
       ns.FireStateChanged()
+      ns.SyncActiveRosterIntoRun()
     end)
     groupSizeCheckboxes[size] = cb
     groupSizeRow:AddChild(cb)
@@ -568,6 +570,10 @@ local function BuildRosterManagerFrame()
       RefreshRosterList()
       ns.FireStateChanged()
     end
+    -- Covers both branches above: SetActiveRoster fires its own
+    -- FireStateChanged, but either way the DB is now in its final state, so
+    -- a single sync call here is enough to push this save into a live run.
+    ns.SyncActiveRosterIntoRun()
   end
 
   local saveBtn = AceGUI:Create("Button")

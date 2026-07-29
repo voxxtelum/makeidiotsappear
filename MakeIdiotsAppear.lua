@@ -333,6 +333,21 @@ local function GetRosterGroupSize(name)
 end
 ns.GetRosterGroupSize = GetRosterGroupSize
 
+-- The "main" portion of a roster that Start Invites actually queues - bench
+-- players (past the roster's own group size) are excluded, same split
+-- OnStartStopClick (UI_Main.lua) and SyncActiveRosterIntoRun below both need,
+-- kept in one place so they can never disagree about who's in vs. benched.
+local function GetTrimmedRosterList(rosterName)
+  local fullList = MakeIdiotsAppearDB.rosters[rosterName] or {}
+  local groupSize = GetRosterGroupSize(rosterName)
+  local list = {}
+  for i = 1, math.min(groupSize, #fullList) do
+    table.insert(list, fullList[i])
+  end
+  return list
+end
+ns.GetTrimmedRosterList = GetTrimmedRosterList
+
 ----------------------------------------------------------------------
 -- Name normalization
 ----------------------------------------------------------------------
@@ -1512,6 +1527,74 @@ local function StartInvites(list)
   end
 end
 ns.StartInvites = StartInvites
+
+-- Called whenever the roster manager (UI_Rosters.lua) saves a player-list
+-- edit, changes a roster's group size, or deletes a roster - so a run
+-- already in progress picks up the change immediately instead of only ever
+-- inviting the snapshot StartInvites captured when the run began. No-ops
+-- unless a run is actually active (also true during the "starting" delay
+-- window, since Engine.running is set alongside Engine.starting - see
+-- StartInvites above). Doesn't need to know which roster was just edited -
+-- it always re-diffs against whatever settings.activeRoster currently is, so
+-- an edit to some other, inactive roster just produces an empty diff against
+-- the unchanged active one and is a harmless no-op.
+--
+-- Only ever touches fullRoster/queue/nextQueue - never pendingInvites or
+-- anyone already in the group. There's no way to un-send an invite or un-add
+-- a group member, so a name dropped from the trimmed list (removed, no
+-- longer any active roster, or pushed onto the bench by a smaller group
+-- size) just stops being retried from here on; whatever's already
+-- outstanding for them resolves on its own.
+local function SyncActiveRosterIntoRun()
+  if not Engine.running then return end
+  local activeRoster = MakeIdiotsAppearDB.settings.activeRoster
+  -- No active roster (e.g. it was just deleted - ns.DeleteRoster clears
+  -- settings.activeRoster before calling this) is treated the same as an
+  -- empty one below, not skipped: the run should still shed anyone in
+  -- fullRoster/queue/nextQueue who's no longer backed by any roster, same as
+  -- it would for a roster that still exists but was emptied out.
+  local newList = activeRoster and GetTrimmedRosterList(activeRoster) or {}
+  local newSet = {}
+  for _, name in ipairs(newList) do
+    newSet[name:lower()] = true
+  end
+
+  local oldSet = {}
+  for _, name in ipairs(Engine.fullRoster) do
+    oldSet[name:lower()] = true
+  end
+
+  for i = #Engine.fullRoster, 1, -1 do
+    if not newSet[Engine.fullRoster[i]:lower()] then
+      table.remove(Engine.fullRoster, i)
+    end
+  end
+  for i = #Engine.queue, 1, -1 do
+    if not newSet[Engine.queue[i]:lower()] then
+      table.remove(Engine.queue, i)
+    end
+  end
+  for i = #Engine.nextQueue, 1, -1 do
+    if not newSet[Engine.nextQueue[i]:lower()] then
+      table.remove(Engine.nextQueue, i)
+    end
+  end
+
+  local addedAny = false
+  for _, name in ipairs(newList) do
+    if not oldSet[name:lower()] then
+      table.insert(Engine.fullRoster, name)
+      table.insert(Engine.queue, name)
+      addedAny = true
+    end
+  end
+
+  FireStateChanged()
+  if addedAny then
+    SafeRunInvitePass()
+  end
+end
+ns.SyncActiveRosterIntoRun = SyncActiveRosterIntoRun
 
 ----------------------------------------------------------------------
 -- Invite failure detection via system chat message

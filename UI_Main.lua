@@ -683,16 +683,10 @@ function OnStartStopClick()
   end
 
   -- Bench players (past the roster's own group size, see
-  -- ns.GetRosterGroupSize) are deliberately excluded from the automated
+  -- ns.GetTrimmedRosterList) are deliberately excluded from the automated
   -- run - they're only invited manually via the "+" button on their own
   -- bench row.
-  local fullList = MakeIdiotsAppearDB.rosters[activeRoster] or {}
-  local groupSize = ns.GetRosterGroupSize(activeRoster)
-  local list = {}
-  for i = 1, math.min(groupSize, #fullList) do
-    table.insert(list, fullList[i])
-  end
-  ns.StartInvites(list)
+  ns.StartInvites(ns.GetTrimmedRosterList(activeRoster))
 end
 
 -- mainFrame.frame's OnHide script fires AceGUI's own "OnClose" (see
